@@ -4,15 +4,15 @@ import tempfile
 import os
 import plotly.graph_objs as go
 import tdt
-import glob
 import hashlib
+import matplotlib.pyplot as plt
 
 from OHRBETsEventExtractor import parse_ohrbets_serial_log, load_data
 from nxtEventExtrator import readfile, get_events, get_event_codes
 
 # Set up Streamlit
 st.set_page_config(layout="wide")
-tab1, tab2 = st.tabs(["📈 Graph Viewer", "📦 Data Extractor"])
+tab1, tab2, tab3 = st.tabs(["📦 Data Extractor","📈 Graph Viewer", "🧪 Peri Event Plots"])
 
 if "code_map" not in st.session_state:
     st.session_state.code_map = code_map = {}
@@ -42,8 +42,106 @@ def get_file_hash(file):
     file.seek(0)
     return hashlib.md5(data).hexdigest()
 
+st.markdown("""
+    <style>
+    .credit-footer {
+        position: fixed;
+        bottom: 8px;
+        right: 15px;
+        font-size: 0.75rem;
+        color: gray;
+        opacity: 0.6;
+        z-index: 100;
+    }
+    </style>
+    <div class="credit-footer">
+        Developed for Parekh Lab © 2025
+            Aryan Bangad
+    </div>
+""", unsafe_allow_html=True)
 
-with tab2:
+
+with tab3:
+    st.title("🧪 Peri-Event Plot Viewer")
+
+    if st.button("🔄 Refresh"):
+        st.rerun()
+
+    if "extracted_data" not in st.session_state or "events" not in st.session_state["extracted_data"]:
+        st.warning("❗ Please extract data and events first from the Data Extractor tab.")
+    else:
+        # Settings
+        event_name = st.selectbox("Select event code for alignment:", sorted(set(e["event"] for e in st.session_state["extracted_data"]["events"] if "event" in e)))
+        signal_set = st.radio("Select signal/control pair:", ["1", "2"], horizontal=True)
+        PRE_TIME = st.number_input("Seconds before event", value=5.0)
+        POST_TIME = st.number_input("Seconds after event", value=10.0)
+        downsample_factor = st.number_input("Downsample factor", min_value=1, value=1, step=1)
+        apply_zscore = st.checkbox("Z-score ΔF/F before peri-event extraction")
+
+        # Load data
+        key_prefix = "" if signal_set == "1" else "2"
+        signal = st.session_state.extracted_data.get(f"signal{signal_set}")
+        control = st.session_state.extracted_data.get(f"control{signal_set}")
+        fs = st.session_state.extracted_data.get("fs")
+
+        if signal is None or control is None or fs is None:
+            st.error("Signal or control data missing.")
+        else:
+            # Downsample
+            if downsample_factor > 1:
+                signal = signal[::downsample_factor]
+                control = control[::downsample_factor]
+                fs = fs / downsample_factor
+
+            # ΔF/F calculation
+            fit = np.polyfit(control, signal, 1)
+            fitted = fit[0] * control + fit[1]
+            dFF = 100 * (signal - fitted) / fitted
+
+            if apply_zscore:
+                dFF = (dFF - np.mean(dFF)) / np.std(dFF)
+
+            time = np.arange(len(dFF)) / fs
+            TRANGE = [int(-PRE_TIME * fs), int(POST_TIME * fs)]
+
+            snippets = []
+
+            for event in st.session_state.extracted_data["events"]:
+                if event.get("event") != event_name:
+                    continue
+                on = event.get("timestamp_s")
+                if on is None or on * fs < -TRANGE[0] or (on * fs + TRANGE[1]) >= len(dFF):
+                    continue
+                idx = int(on * fs)
+                snippet = dFF[idx + TRANGE[0]:idx + TRANGE[1]]
+                if len(snippet) == (TRANGE[1] - TRANGE[0]):
+                    snippets.append(snippet)
+
+            if not snippets:
+                st.warning("No valid event-aligned snippets found.")
+            else:
+                snippets = np.array(snippets)
+                mean_snip = np.mean(snippets, axis=0)
+                std_snip = np.std(snippets, axis=0)
+                peri_time = np.linspace(TRANGE[0], TRANGE[1], len(mean_snip)) / fs
+
+                fig = plt.figure(figsize=(12, 6))
+                ax = fig.add_subplot(111)
+
+                for snip in snippets:
+                    ax.plot(peri_time, snip, linewidth=0.5, color='gray', alpha=0.5)
+                ax.plot(peri_time, mean_snip, color='green', linewidth=2, label='Mean ΔF/F')
+                ax.fill_between(peri_time, mean_snip - std_snip, mean_snip + std_snip, color='green', alpha=0.2, label='±STD')
+                ax.axvline(0, color='slategray', linestyle='--', linewidth=2, label=f'{event_name} Onset')
+                ax.set_title("Peri-Event ΔF/F Response (Z-scored)" if apply_zscore else "Peri-Event ΔF/F Response")
+                ax.set_xlabel("Time (s)")
+                ax.set_ylabel("ΔF/F (Z-score)" if apply_zscore else "ΔF/F (%)")
+                ax.legend()
+                ax.grid(True)
+
+                st.pyplot(fig,use_container_width = False)
+
+with tab1:
     st.title("📂 TDT + Events Data Extractor")
     base_path = st.text_input("Base folder path", value=st.session_state.tdt_settings["data_folder"] or ".")
     if os.path.isdir(base_path):
@@ -161,9 +259,9 @@ with tab2:
                 st.success("Code map updated.")
 
 # =====================
-# TAB 1: Graph Viewer
+# TAB 2: Graph Viewer
 # =====================
-with tab1:
+with tab2:
     st.title("Fiber Photometry Grapher (Interactive)")
 
     downsample_factor = st.number_input("Downsampling factor", min_value=1, value=100)
@@ -213,12 +311,17 @@ with tab1:
             dF = dF[idx:]
             dF_z = dF_z[idx:]
 
+            if label_prefix=="channel 2":
+                dF = dF + 3
+
             fig.add_trace(go.Scatter(
                 x=time,
                 y=dF if plot_choice == "ΔF/F" else dF_z,
                 mode='lines',
                 name=f"{label_prefix} {plot_choice}",
-                line=dict(color=color)
+                line=dict(color=color),
+                legendgrouptitle=dict(font=dict(color='black'))
+
             ))
 
         process_trace(data["signal1"], data["control1"], "blue", "Channel 1")
@@ -244,7 +347,10 @@ with tab1:
         plot_bgcolor='white',
         paper_bgcolor='white',
         hovermode='closest',
-        height=500
+        height=500,
+        legend=dict(font=dict(
+            color="black"     # Specify the font color
+        ))
     )
 
         # --- Overlay Events (Dynamic) ---
