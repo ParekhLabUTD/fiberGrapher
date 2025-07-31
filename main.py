@@ -1,11 +1,15 @@
-import subprocess
+# main.py
+import streamlit.web.cli as stcli
 import sys
 import os
 
 def main():
-    base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-    app_path = os.path.join(base_dir, 'graphApp.py')
-    subprocess.run(["streamlit", "run", app_path])
+    # Locate the bundled path to graphApp.py
+    base_path = getattr(sys, '_MEIPASS', os.path.abspath("."))
+    app_path = os.path.join(base_path, "graphApp.py")
 
-if __name__ == '__main__':
+    sys.argv = ["streamlit", "run", app_path]
+    sys.exit(stcli.main())
+
+if __name__ == "__main__":
     main()
