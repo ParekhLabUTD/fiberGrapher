@@ -6,9 +6,14 @@ import plotly.graph_objs as go
 import tdt
 import hashlib
 import matplotlib.pyplot as plt
+import itertools
 
 from OHRBETsEventExtractor import parse_ohrbets_serial_log, load_data
 from nxtEventExtrator import readfile, get_events, get_event_codes
+
+color_cycle = itertools.cycle([
+    "red", "blue", "green", "purple", "orange", "brown", "pink", "gray"
+])
 
 # Set up Streamlit
 st.set_page_config(layout="wide")
@@ -261,6 +266,10 @@ with tab1:
 # =====================
 # TAB 2: Graph Viewer
 # =====================
+import streamlit as st
+import numpy as np
+import plotly.graph_objs as go
+
 with tab2:
     st.title("Fiber Photometry Grapher (Interactive)")
 
@@ -282,6 +291,10 @@ with tab2:
             label = st.session_state.code_map.get(code, f"Code {code}")
             enabled = st.checkbox(f"Show: {label}", value=True, key=f"show_event_{code}")
             enabled_events[code] = enabled
+        code_colors = {}
+        for code in sorted(enabled_events.keys()):
+            if enabled_events[code]:
+                code_colors[code] = next(color_cycle)
 
     show_second_channel = False
     if "signal2" in st.session_state.get("extracted_data", {}) and st.session_state.extracted_data["signal2"] is not None:
@@ -311,7 +324,7 @@ with tab2:
             dF = dF[idx:]
             dF_z = dF_z[idx:]
 
-            if label_prefix=="channel 2":
+            if label_prefix == "channel 2":
                 dF = dF + 3
 
             fig.add_trace(go.Scatter(
@@ -321,7 +334,6 @@ with tab2:
                 name=f"{label_prefix} {plot_choice}",
                 line=dict(color=color),
                 legendgrouptitle=dict(font=dict(color='black'))
-
             ))
 
         process_trace(data["signal1"], data["control1"], "blue", "Channel 1")
@@ -331,48 +343,62 @@ with tab2:
 
         fig.update_layout(
             title=dict(text="Fiber Photometry with Behavioral Events", font=dict(color='black')),
-        template="plotly_white",
-        xaxis=dict(
-            title=dict(text ="Time (s)",font=dict(color='black')),
-            color='black',
-            tickfont=dict(color='black'),
-            rangeslider=dict(visible=True)
-        ),
-        yaxis=dict(
-            title=dict(text = "ΔF/F (%)" if plot_choice == "ΔF/F" else "Z-scored ΔF/F",font=dict(color='black')),
-            color='black',
-            tickfont=dict(color='black'),
-        ),
-        font=dict(color="black"),
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        hovermode='closest',
-        height=500,
-        legend=dict(font=dict(
-            color="black"     # Specify the font color
-        ))
-    )
+            template="plotly_white",
+            xaxis=dict(
+                title=dict(text="Time (s)", font=dict(color='black')),
+                color='black',
+                tickfont=dict(color='black'),
+                rangeslider=dict(visible=True)
+            ),
+            yaxis=dict(
+                title=dict(text="ΔF/F (%)" if plot_choice == "ΔF/F" else "Z-scored ΔF/F", font=dict(color='black')),
+                color='black',
+                tickfont=dict(color='black'),
+            ),
+            font=dict(color="black"),
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            hovermode='closest',
+            height=500,
+            legend=dict(font=dict(color="black"))
+        )
 
-        # --- Overlay Events (Dynamic) ---
-        for event in st.session_state.extracted_data.get("events", []):
-            t = event.get("timestamp_s")
-            code = event.get("code")
+        # --- Overlay Events (Optimized) ---
+        events_to_plot = [
+            e for e in st.session_state.extracted_data.get("events", [])
+            if e.get("code") in enabled_events and enabled_events[e["code"]]
+        ]
 
-            if t is None or t < 0:
-                continue
+        # Group events by code
+        grouped_events = {}
+        for event in events_to_plot:
+            code = event["code"]
+            grouped_events.setdefault(code, []).append(event["timestamp_s"] - cutoff_time)
 
-            if not enabled_events.get(code, False):
-                continue
+        # Get y-limits from data traces
+        ymins, ymaxs = [], []
+        for trace in fig.data:
+            ymins.append(np.min(trace.y))
+            ymaxs.append(np.max(trace.y))
+        ymin = float(np.min(ymins)) if ymins else -1
+        ymax = float(np.max(ymaxs)) if ymaxs else 1
 
+        # Add one trace per event code (fast)
+        for code, times in grouped_events.items():
             label = st.session_state.code_map.get(code, f"Code {code}")
-            fig.add_vline(
-            x=t - cutoff_time,
-        line=dict(color='red', dash='dash'),
-        annotation_text=label,
-        annotation_position="top left",
-        annotation_font=dict(color='black'),
-        annotation=dict(bgcolor='white')
-            )
+            color = code_colors.get(code, "black")
 
+            x_vals, y_vals = [], []
+            for t in times:
+                x_vals.extend([t, t, None])
+                y_vals.extend([ymin, ymax, None])
+
+            fig.add_trace(go.Scatter(
+                x=x_vals, y=y_vals,
+                mode="lines",
+                line=dict(color=color, width=1, dash="dash"),
+                name=label,
+                hoverinfo="skip"
+            ))
 
         st.plotly_chart(fig, use_container_width=True)
