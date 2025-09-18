@@ -33,7 +33,8 @@ if "tdt_settings" not in st.session_state:
         "signal2_stream": None,
         "control2_stream": None,
         "align_stream": None,
-        "extract_pct": False
+        "extract_pct": False,
+        "pct_channel": None
     }
 
 
@@ -160,6 +161,7 @@ with tab1:
         try:
             data = load_tdt_block(full_path)
             streams = list(data.streams.keys())
+            pcts = list(data.epocs.keys())
 
             st.markdown("---")
             st.subheader("🔌 Select Signal/Control Streams")
@@ -173,6 +175,10 @@ with tab1:
                 st.selectbox("Control 2 (optional)", [None] + streams, index=streams.index(st.session_state.tdt_settings["control2_stream"]) + 1 if st.session_state.tdt_settings["control2_stream"] in streams else 0, key="control2_stream")
 
             pctBool = st.checkbox("Also extract OHRBETS PCT data for events extraction?", key="extract_pct")
+            if pctBool:
+                st.selectbox("PtC channels",[None] + pcts, index=pcts.index(st.session_state.tdt_settings["pct_channel"]) + 1 if st.session_state.tdt_settings["pct_channel"] in pcts else 0, key="pct_channel")
+            else:
+                st.session_state.pct_channel = None
 
             if st.button("📥 Extract Data"):
                 tdt_data = {
@@ -180,7 +186,7 @@ with tab1:
                 "control1": data.streams[st.session_state.control_stream].data if st.session_state.control_stream else None,
                 "signal2": data.streams[st.session_state.signal2_stream].data if st.session_state.signal2_stream else None,
                 "control2": data.streams[st.session_state.control2_stream].data if st.session_state.control2_stream else None,
-                "pct": data.epocs['PtC1'].onset if pctBool else None,
+                "pct": (data.epocs[st.session_state.pct_channel].onset if st.session_state.pct_channel else None ) if pctBool else None,
                 "fs": data.streams[st.session_state.signal_stream].fs if st.session_state.signal_stream else None,
                 }
 
@@ -266,9 +272,6 @@ with tab1:
 # =====================
 # TAB 2: Graph Viewer
 # =====================
-import streamlit as st
-import numpy as np
-import plotly.graph_objs as go
 
 with tab2:
     st.title("Fiber Photometry Grapher (Interactive)")
