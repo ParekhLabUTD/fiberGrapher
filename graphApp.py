@@ -12,7 +12,7 @@ from OHRBETsEventExtractor import parse_ohrbets_serial_log, load_data
 from nxtEventExtrator import readfile, get_events, get_event_codes
 
 color_cycle = itertools.cycle([
-    "red", "blue", "green", "purple", "orange", "brown", "pink", "gray"
+    "red", "green", "purple", "orange", "brown", "pink", "gray"
 ])
 
 # Set up Streamlit
@@ -145,7 +145,7 @@ with tab3:
                 ax.legend()
                 ax.grid(True)
 
-                st.pyplot(fig,use_container_width = False)
+                st.pyplot(fig,width='content')
 
 with tab1:
     st.title("📂 TDT + Events Data Extractor")
@@ -294,6 +294,7 @@ with tab2:
             label = st.session_state.code_map.get(code, f"Code {code}")
             enabled = st.checkbox(f"Show: {label}", value=True, key=f"show_event_{code}")
             enabled_events[code] = enabled
+        
         code_colors = {}
         for code in sorted(enabled_events.keys()):
             if enabled_events[code]:
@@ -404,4 +405,4 @@ with tab2:
                 hoverinfo="skip"
             ))
 
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
