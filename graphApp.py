@@ -1,8 +1,10 @@
+from email.policy import default
 import streamlit as st
 import numpy as np
 import tempfile
 import os
 import plotly.graph_objs as go
+from sympy import content
 import tdt
 import hashlib
 import matplotlib.pyplot as plt
@@ -77,15 +79,22 @@ with tab3:
         st.warning("❗ Please extract data and events first from the Data Extractor tab.")
     else:
         # Settings
-        event_name = st.selectbox("Select event code for alignment:", sorted(set(e["event"] for e in st.session_state["extracted_data"]["events"] if "event" in e)))
+        event_name = st.selectbox(
+            "Select event code for alignment:",
+            sorted(set(e["event"] for e in st.session_state["extracted_data"]["events"] if "event" in e))
+        )
         signal_set = st.radio("Select signal/control pair:", ["1", "2"], horizontal=True)
         PRE_TIME = st.number_input("Seconds before event", value=5.0)
         POST_TIME = st.number_input("Seconds after event", value=10.0)
+        baseline_mode = st.checkbox("Pre-event baseline?", value=False)
+        if baseline_mode:
+            lowerBound = st.number_input("Enter the lower bound of baseline period from T0 (s)", value=-4.0)
+            upperBound = st.number_input("Enter the upper bound of baseline period from T0 (s)", value=-1.0)
+        else:
+            lowerBound, upperBound = 0, 0
         downsample_factor = st.number_input("Downsample factor", min_value=1, value=1, step=1)
-        apply_zscore = st.checkbox("Z-score ΔF/F before peri-event extraction")
 
         # Load data
-        key_prefix = "" if signal_set == "1" else "2"
         signal = st.session_state.extracted_data.get(f"signal{signal_set}")
         control = st.session_state.extracted_data.get(f"control{signal_set}")
         fs = st.session_state.extracted_data.get("fs")
@@ -104,12 +113,7 @@ with tab3:
             fitted = fit[0] * control + fit[1]
             dFF = 100 * (signal - fitted) / fitted
 
-            if apply_zscore:
-                dFF = (dFF - np.mean(dFF)) / np.std(dFF)
-
-            time = np.arange(len(dFF)) / fs
             TRANGE = [int(-PRE_TIME * fs), int(POST_TIME * fs)]
-
             snippets = []
 
             for event in st.session_state.extracted_data["events"]:
@@ -118,10 +122,43 @@ with tab3:
                 on = event.get("timestamp_s")
                 if on is None or on * fs < -TRANGE[0] or (on * fs + TRANGE[1]) >= len(dFF):
                     continue
+
                 idx = int(on * fs)
-                snippet = dFF[idx + TRANGE[0]:idx + TRANGE[1]]
-                if len(snippet) == (TRANGE[1] - TRANGE[0]):
-                    snippets.append(snippet)
+
+                # peri-event snippet
+                snippet = dFF[idx + TRANGE[0]: idx + TRANGE[1]]
+                if len(snippet) != (TRANGE[1] - TRANGE[0]):
+                    continue
+
+                if baseline_mode:
+                    # ----------------------------
+                    # Per-event baseline z-scoring
+                    # ----------------------------
+                    baseline_start = int((on + lowerBound) * fs)
+                    baseline_end   = int((on + upperBound) * fs)
+
+                    # Clip to global dFF bounds
+                    baseline_start = max(0, baseline_start)
+                    baseline_end   = min(len(dFF), baseline_end)
+
+                    if baseline_end > baseline_start:
+                        baseline_vals = dFF[baseline_start:baseline_end]
+                        baseline_mean = np.mean(baseline_vals)
+                        baseline_std  = np.std(baseline_vals)
+
+                        if baseline_std > 0:
+                            snippet = (snippet - baseline_mean) / baseline_std
+                        else:
+                            snippet = snippet - baseline_mean
+                else:
+                    # ----------------------------
+                    # Global z-scoring (whole trace)
+                    # ----------------------------
+                    trace_mean = np.mean(dFF)
+                    trace_std = np.std(dFF)
+                    snippet = (snippet - trace_mean) / (trace_std if trace_std > 0 else 1.0)
+
+                snippets.append(snippet)
 
             if not snippets:
                 st.warning("No valid event-aligned snippets found.")
@@ -129,23 +166,41 @@ with tab3:
                 snippets = np.array(snippets)
                 mean_snip = np.mean(snippets, axis=0)
                 std_snip = np.std(snippets, axis=0)
-                peri_time = np.linspace(TRANGE[0], TRANGE[1], len(mean_snip)) / fs
+
+                # peri-event time vector in seconds
+                peri_time = np.arange(TRANGE[0], TRANGE[1]) / fs
 
                 fig = plt.figure(figsize=(12, 6))
                 ax = fig.add_subplot(111)
 
+                # Plot individual traces
                 for snip in snippets:
                     ax.plot(peri_time, snip, linewidth=0.5, color='gray', alpha=0.5)
+
+                # Mean ± STD
                 ax.plot(peri_time, mean_snip, color='green', linewidth=2, label='Mean ΔF/F')
-                ax.fill_between(peri_time, mean_snip - std_snip, mean_snip + std_snip, color='green', alpha=0.2, label='±STD')
+                ax.fill_between(peri_time, mean_snip - std_snip, mean_snip + std_snip,
+                                color='green', alpha=0.2, label='±STD')
+
+                # Event onset marker
                 ax.axvline(0, color='slategray', linestyle='--', linewidth=2, label=f'{event_name} Onset')
-                ax.set_title("Peri-Event ΔF/F Response (Z-scored)" if apply_zscore else "Peri-Event ΔF/F Response")
+
+                # Labels
+                if baseline_mode:
+                    title_str = f"Peri-Event ΔF/F (Baseline Z-score: {lowerBound}s to {upperBound}s)"
+                    ylabel_str = "ΔF/F (Baseline Z-score)"
+                else:
+                    title_str = "Peri-Event ΔF/F (Global Z-score)"
+                    ylabel_str = "ΔF/F (Global Z-score)"
+
+                ax.set_title(title_str)
                 ax.set_xlabel("Time (s)")
-                ax.set_ylabel("ΔF/F (Z-score)" if apply_zscore else "ΔF/F (%)")
+                ax.set_ylabel(ylabel_str)
                 ax.legend()
                 ax.grid(True)
 
-                st.pyplot(fig,width='content')
+                st.pyplot(fig, width='stretch')
+
 
 with tab1:
     st.title("📂 TDT + Events Data Extractor")
@@ -272,7 +327,6 @@ with tab1:
 # =====================
 # TAB 2: Graph Viewer
 # =====================
-
 with tab2:
     st.title("Fiber Photometry Grapher (Interactive)")
 
@@ -289,6 +343,7 @@ with tab2:
 
     if "extracted_data" in st.session_state and "events" in st.session_state.extracted_data:
         all_codes = sorted(set(event["code"] for event in st.session_state.extracted_data["events"] if "code" in event))
+        all_names = sorted(set(event["event_name"] for event in st.session_state.extracted_data["events"] if "event_name" in event))
         st.markdown("**Select which event codes to overlay:**")
         for code in all_codes:
             label = st.session_state.code_map.get(code, f"Code {code}")
@@ -318,7 +373,7 @@ with tab2:
             control_ds = np.array([np.mean(control[i:i+downsample_factor]) for i in range(0, len(control), downsample_factor)])
             time = np.arange(len(signal_ds)) / data["fs"] * downsample_factor
 
-            fit = np.polyfit(control_ds, signal_ds, 1)
+            fit = np.polyfit(control_ds,signal_ds, 1)
             fitted = fit[0] * control_ds + fit[1]
             dF = 100 * ((signal_ds - fitted) / fitted)
             dF_z = (dF - np.mean(dF)) / np.std(dF)

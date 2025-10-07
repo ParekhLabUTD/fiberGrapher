@@ -12,7 +12,11 @@ def load_data(file_path):
 
 code_map = {
     51: 'tone',
-    31: 'lick'
+    31: 'lick',
+    13: 'spout extended',
+    15: 'spout retracted',
+    71: 'inactive turns',
+    81: 'active turns'
 }
 
 def parse_ohrbets_serial_log(data):
