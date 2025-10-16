@@ -77,20 +77,7 @@ def add_events_to_sessions(metadata):
         if data['event_interpretor'] == 1:
             print("not made yet")
         elif data['event_interpretor'] == 2:
-            event_uncorrect = parse_ohrbets_serial_log(data['event_file_path'])
-            block_info = tdt.read_block(data['path'])
-            if data['signalChannelSet'] == 1:
-                block_pct = 'PtC1'
-            else:
-                block_pct = "PtC2"
-            pctOnset = (block_info.epocs[block_pct].onset)[1]
-            event_correct = []
-            for event in event_uncorrect:
-                if event['timestamp_s'] - pctOnset>0:
-                    event['timestamp_s'] = event['timestamp_s'] - pctOnset
-                    event_correct.append(event)
-            data['events'] = event_correct
-
+            data['events']  = parse_ohrbets_serial_log(data['event_file_path'])
         else:
             data_temp = readfile(data['event_file_path'])
             code_map = {

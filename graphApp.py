@@ -380,6 +380,9 @@ with tab2:
             st.stop()
 
         data = st.session_state.extracted_data
+        pct_onset = data["pct"][1]              # or however your PCT onset is stored
+        code12_times = [e["timestamp_s"] for e in data["events"] if e["code"] == 12]
+        offset = pct_onset - code12_times[1]
 
         fig = go.Figure()
 
@@ -387,6 +390,12 @@ with tab2:
             signal_ds = np.array([np.mean(signal[i:i+downsample_factor]) for i in range(0, len(signal), downsample_factor)])
             control_ds = np.array([np.mean(control[i:i+downsample_factor]) for i in range(0, len(control), downsample_factor)])
             time = np.arange(len(signal_ds)) / data["fs"] * downsample_factor
+
+            time -= offset
+            valid = time >= 0
+            time = time[valid]
+            signal_ds = signal_ds[valid]
+            control_ds = control_ds[valid]
 
             fit = np.polyfit(control_ds,signal_ds, 1)
             fitted = fit[0] * control_ds + fit[1]
@@ -447,7 +456,7 @@ with tab2:
         grouped_events = {}
         for event in events_to_plot:
             code = event["code"]
-            grouped_events.setdefault(code, []).append(event["timestamp_s"] - cutoff_time)
+            grouped_events.setdefault(code, []).append(event["timestamp_s"] - offset)
 
         # Get y-limits from data traces
         ymins, ymaxs = [], []
@@ -476,6 +485,7 @@ with tab2:
             ))
 
         st.plotly_chart(fig, width='stretch')
+
 with tab4:
     st.title("📊 Multi-Block Fiber Photometry Analyzer")
 
@@ -700,6 +710,27 @@ with tab4:
                     sig = np.asarray(block.streams[sig_key].data).flatten()
                     ctrl = np.asarray(block.streams[ctrl_key].data).flatten()
                     fs_orig = float(block.streams[sig_key].fs)
+
+                    if meta.get('interpretor',1) ==2: 
+                        if meta.get('signalChannelSet',1) == 1:
+                            pct_name = 'PtC1'
+                        else:
+                            pct_name = 'PtC2'
+                        onset_list = block.epocs[pct_name].onset
+                        try:
+                            pct_onset = float(onset_list[1])  # confirm this index corresponds to onset
+                            code12_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 12]
+                            if len(code12_times) < 2:
+                                print(f"WARNING: less than 2 code-12 events for session {s_path}; skipping alignment.", flush=True)
+                            else:
+                                offset = pct_onset - code12_times[1]
+                                time_full = np.arange(len(sig)) / fs_orig
+                                time_full -= offset
+                                valid = time_full >= 0
+                                sig = sig[valid]
+                                ctrl = ctrl[valid]
+                        except Exception as e:
+                            print(f"WARNING: alignment failed for {s_path}: {e}", flush=True)
 
                     # Downsample BEFORE dF/F if requested (simple decimation)
                     ds = int(downsample_factor)

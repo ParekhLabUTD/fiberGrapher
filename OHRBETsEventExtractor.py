@@ -5,6 +5,7 @@ code_map = {
     31: 'lick',
     13: 'spout extended',
     15: 'spout retracted',
+    12: 'brake disengaged'
 }
 
 # Utility function to get event codes
