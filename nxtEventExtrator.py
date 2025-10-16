@@ -1,7 +1,6 @@
 def readfile(path):
     with open(path, 'r') as file:
         data = file.read()
-
     return data.split()
 
 def get_event_codes(data):
