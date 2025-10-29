@@ -119,6 +119,29 @@ with tab3:
         if signal is None or control is None or fs is None:
             st.error("Signal or control data missing.")
         else:
+            # --- Optional PCT alignment ---
+            apply_pct_alignment = st.checkbox("Align signal to PCT's 2nd onset (code 12)", value=False)
+            if apply_pct_alignment:
+                try:
+                    pct = st.session_state.extracted_data.get("pct", [])
+                    events = st.session_state.extracted_data.get("events", [])
+                    if len(pct) < 2:
+                        st.warning("Less than 2 PCT onsets found — skipping alignment.")
+                    else:
+                        pct_onset = float(pct[1])
+                        code12_times = [e["timestamp_s"] for e in events if e.get("code") == 12]
+                        if len(code12_times) < 2:
+                            st.warning("Less than 2 code-12 events found — skipping alignment.")
+                        else:
+                            offset = pct_onset - code12_times[1]
+                            time_full = np.arange(len(signal)) / fs
+                            time_full -= offset
+                            valid = time_full >= 0
+                            signal = signal[valid]
+                            control = control[valid]
+                            st.info(f"Applied PCT alignment offset of {offset:.3f} s")
+                except Exception as e:
+                    st.warning(f"Alignment failed: {e}")
             # Downsample
             if downsample_factor > 1:
                 signal = signal[::downsample_factor]
@@ -402,11 +425,6 @@ with tab2:
             dF = 100 * ((signal_ds - fitted) / fitted)
             dF_z = (dF - np.mean(dF)) / np.std(dF)
 
-            idx = np.searchsorted(time, cutoff_time)
-            time = time[idx:] - time[idx]
-            dF = dF[idx:]
-            dF_z = dF_z[idx:]
-
             if label_prefix == "channel 2":
                 dF = dF + 3
 
@@ -456,7 +474,7 @@ with tab2:
         grouped_events = {}
         for event in events_to_plot:
             code = event["code"]
-            grouped_events.setdefault(code, []).append(event["timestamp_s"] - offset)
+            grouped_events.setdefault(code, []).append(event["timestamp_s"])
 
         # Get y-limits from data traces
         ymins, ymaxs = [], []
