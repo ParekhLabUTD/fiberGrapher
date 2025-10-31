@@ -2,13 +2,13 @@ import os
 import json
 import math
 import itertools
-import traceback
 from collections import defaultdict
 from datetime import datetime as dt
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
 
 # helper safe name if you already have one, otherwise use this
 def _safe_name(s: str) -> str:
@@ -67,7 +67,9 @@ def run_batch_processing(
     per_mouse_summary_metrics = defaultdict(list) # mouse -> list of dicts (trial-level metrics) for mouse_summary later
 
     # flags for plotting
-    color_cycle = itertools.cycle(None)  # let matplotlib choose colors
+    color_cycle = itertools.cycle([
+    "red", "green", "purple", "orange", "brown", "pink", "gray"
+    ]) # let matplotlib choose colors
 
     # iterate groups -> mice -> sessions
     summary["n_groups"] = len(groups_dict)
@@ -349,19 +351,77 @@ def run_batch_processing(
 
                 processed_sessions.add(s_path)
 
-    # -------------------
-    # per-mouse aggregation (z-scored trials already pooled per mouse)
+# -------------------
+# per-mouse aggregation (z-scored trials already pooled per mouse)
     mice_count = len(per_mouse_pooled_trials)
     summary["n_mice"] = len(mice_seen)
     if verbose:
         print(f"\n--- Per-mouse pooling for {mice_count} mice ---", flush=True)
 
-    per_group_mouse_means = defaultdict(list)   # group -> list of mouse mean traces
-    per_group_mouse_metrics_rows = defaultdict(list)  # group-> rows for group_summary_metrics.csv
+    # We'll build per-group structures that keep mouse labels aligned with means
+    # per_group_mouse_means: group -> list of arrays (mouse means)
+    # per_group_mouse_metrics_rows: group -> list of dict rows (contain 'mouse' field)
+    # These were filled earlier. We'll assume their order matches.
+
+    per_group_mouse_means_fixed = defaultdict(list)
+    per_group_mouse_metrics_rows_fixed = defaultdict(list)
+        # ---- DEBUG DUMP (insert here) ----
+    import hashlib
+
+    def arr_hash(a):
+        # round to 6 decimals then hash bytes for compact fingerprint
+        try:
+            b = np.round(a, 6).tobytes()
+        except Exception:
+            # if a is list-of-arrays, compute hash of flattened mean
+            a = np.asarray(a)
+            b = np.round(a, 6).tobytes()
+        return hashlib.md5(b).hexdigest()
+
+    print("\n--- DEBUG DUMP START ---", flush=True)
+
+    # 1) groups_dict structure
+    print("groups_dict (raw):", repr(groups_dict), flush=True)
+
+    # 2) mice_seen
+    print("mice_seen:", repr(mice_seen), flush=True)
+
+    # 3) per_mouse_pooled_trials details
+    print("\nper_mouse_pooled_trials keys and info:", flush=True)
+    for m, trials in per_mouse_pooled_trials.items():
+        try:
+            trials_arr = np.vstack(trials)   # trials x samples
+            mean_trace = np.mean(trials_arr, axis=0)
+            print(f"  MOUSE: {m} | n_trials={len(trials)} | mean_shape={mean_trace.shape} | hash={arr_hash(mean_trace)} | first5={np.around(mean_trace[:5],4).tolist()}", flush=True)
+        except Exception as e:
+            print(f"  MOUSE: {m} | ERROR building mean: {e}", flush=True)
+
+    # 4) per_group mapping summary (after building per_group_mouse_means_fixed)
+    print("\nper_group_mouse_means_fixed summary:", flush=True)
+    for gname, mm_list in per_group_mouse_means_fixed.items():
+        print(f"  GROUP: {gname} | n_mouse_means={len(mm_list)}", flush=True)
+        for idx, mm in enumerate(mm_list):
+            mm_arr = np.asarray(mm)
+            print(f"    mouse_idx={idx} | mean_shape={mm_arr.shape} | hash={arr_hash(mm_arr)} | first3={np.round(mm_arr[:3],4).tolist()}", flush=True)
+
+    # 5) event_folder file listing (top-level)
+    try:
+        top_files = []
+        for root, dirs, files in os.walk(event_folder):
+            # print only first-level for brevity
+            if root == event_folder:
+                print("\nTop-level event_folder contents:", "dirs:", dirs, "files:", files, flush=True)
+                break
+    except Exception as e:
+        print("Could not list event_folder:", e, flush=True)
+
+    print("--- DEBUG DUMP END ---\n", flush=True)
+    # ---- end debug dump ----
+
+
     for mouse_id, trial_list in per_mouse_pooled_trials.items():
         if len(trial_list) == 0:
             continue
-        # stack trials (all already z-scored per-session)
         trials_arr = np.vstack(trial_list)  # trials x samples
         mouse_mean = np.mean(trials_arr, axis=0)
         mouse_sem = trials_arr.std(axis=0) / math.sqrt(trials_arr.shape[0])
@@ -381,11 +441,10 @@ def run_batch_processing(
         })
         timepoint_df.to_csv(mouse_combined_metrics_csv, index=False)
 
-        # summary scalar metrics (mean across all trials for this mouse)
+        # summary scalar metrics (use rows collected earlier)
         mouse_metric_rows = per_mouse_summary_metrics.get(mouse_id, [])
         if len(mouse_metric_rows) > 0:
             mdf = pd.DataFrame(mouse_metric_rows)
-            # compute per-mouse mean peak/auc/latency (ignoring NaNs)
             mean_peak = float(mdf["peak"].mean(skipna=True))
             mean_auc = float(mdf["auc"].mean(skipna=True))
             mean_latency = float(mdf["latency"].mean(skipna=True))
@@ -404,25 +463,24 @@ def run_batch_processing(
 
         # save mouse combined trace plot
         fig, ax = plt.subplots(figsize=(6,4))
-        ax.plot(peri_times, mouse_mean)
-        ax.fill_between(peri_times, mouse_mean - mouse_sem, mouse_mean + mouse_sem, alpha=0.3)
+        ax.plot(peri_times, mouse_mean, label=f"{mouse_id}")
+        ax.fill_between(peri_times, mouse_mean - mouse_sem, mouse_mean + mouse_sem, alpha=0.25)
         ax.axvline(0, color="red", linestyle="--")
         ax.set_title(f"Mouse combined: {mouse_id}")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("ΔF/F (z-scored baseline)")
+        ax.legend(loc="best")
         fig.tight_layout()
         fig.savefig(mouse_combined_plot)
         plt.close(fig)
         if verbose:
             print(f"Saved mouse combined plot -> {mouse_combined_plot}", flush=True)
 
-        # find which group(s) this mouse belongs to so we can add to per-group aggregate
-        # groups_dict structure: group -> {mouse: [sessionpaths]}
+        # attach mouse mean to each group it belongs to (preserve order for later zipping)
         for gname, mice in groups_dict.items():
             if mouse_id in mice:
-                per_group_mouse_means[gname].append(mouse_mean)
-                # create per-mouse row for group summary metrics
-                per_group_mouse_metrics_rows[gname].append({
+                per_group_mouse_means_fixed[gname].append(mouse_mean)
+                per_group_mouse_metrics_rows_fixed[gname].append({
                     "group": gname,
                     "mouse": mouse_id,
                     "mean_peak": mean_peak,
@@ -431,10 +489,26 @@ def run_batch_processing(
                     "n_trials": n_trials
                 })
 
+    # Replace the originals with the fixed structures for plotting below
+    per_group_mouse_means = per_group_mouse_means_fixed
+    per_group_mouse_metrics_rows = per_group_mouse_metrics_rows_fixed
+
+    # Ensure single comparison folder exists
+    comparison_root = os.path.join(event_folder, "comparison")
+    os.makedirs(comparison_root, exist_ok=True)
+    summary["output_files"]["comparison_root"] = comparison_root
+
     # -------------------
-    # group-level aggregates and plots
+    # group-level aggregates and plots (use provided color_cycle for group colors)
     if verbose:
         print("\n--- Group-level aggregation ---", flush=True)
+
+    group_color_cycle = itertools.cycle([
+        "red", "green", "purple", "orange", "brown", "pink", "gray"
+    ])
+
+    # track group-level means for the final comparison plot
+    group_means_for_comparison = {}
 
     for gname, mouse_means in per_group_mouse_means.items():
         gfolder = os.path.join(groups_root, _safe_name(gname))
@@ -448,59 +522,84 @@ def run_batch_processing(
             summary["errors"].append({"group": gname, "error": "no_mouse_means"})
             continue
 
+        # compute group mean and sem across mice
         arr = np.vstack(mouse_means)  # mice x samples
         g_mean = np.mean(arr, axis=0)
         g_sem = arr.std(axis=0) / math.sqrt(arr.shape[0])
+        group_means_for_comparison[gname] = (g_mean, g_sem)
 
-        # save group mean trace
+        # pick this group's color
+        group_color = next(group_color_cycle)
+
+        # Plot group mean +/- SEM
         fig, ax = plt.subplots(figsize=(6,4))
-        ax.plot(peri_times, g_mean, label=gname)
-        ax.fill_between(peri_times, g_mean - g_sem, g_mean + g_sem, alpha=0.3)
-        ax.axvline(0, color="red", linestyle="--")
+        ax.plot(peri_times, g_mean, label=f"{gname} mean", color=group_color)
+        ax.fill_between(peri_times, g_mean - g_sem, g_mean + g_sem, alpha=0.25, color=group_color)
+
+        # Also overlay each mouse mean using same color but lighter alpha, and label mice
+        mouse_info_rows = per_group_mouse_metrics_rows.get(gname, [])
+        for idx, mm in enumerate(mouse_means):
+            mouse_label = mouse_info_rows[idx]["mouse"] if idx < len(mouse_info_rows) else f"mouse_{idx}"
+            ax.plot(peri_times, mm, alpha=0.6, linestyle='-', label=mouse_label, linewidth=1.0)
+
+        ax.axvline(0, color="black", linestyle="--")
         ax.set_title(f"Group avg: {gname}")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("ΔF/F (z-scored baseline)")
+        ax.legend(loc="best", fontsize="small")
         fig.tight_layout()
         fig.savefig(group_mean_plot)
         plt.close(fig)
         if verbose:
             print(f"Saved group mean plot -> {group_mean_plot}", flush=True)
 
-        # save overlay of each mouse mean
+        # save overlay of each mouse mean (separate larger figure)
         fig, ax = plt.subplots(figsize=(8,5))
-        for mm in mouse_means:
-            ax.plot(peri_times, mm, alpha=0.6)
+        for idx, mm in enumerate(mouse_means):
+            mouse_label = mouse_info_rows[idx]["mouse"] if idx < len(mouse_info_rows) else f"mouse_{idx}"
+            ax.plot(peri_times, mm, label=mouse_label, alpha=0.8)
         ax.axvline(0, color="black", linestyle="--")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("ΔF/F (z-scored baseline)")
         ax.set_title(f"All mice traces: {gname}")
+        ax.legend(loc="best", fontsize="small")
         fig.tight_layout()
         fig.savefig(group_all_mice_plot)
         plt.close(fig)
         if verbose:
             print(f"Saved group all-mice overlay -> {group_all_mice_plot}", flush=True)
 
-        # group summary CSV listing each mouse's mean metrics
+        # save group summary CSV listing each mouse's mean metrics
         gm_df = pd.DataFrame(per_group_mouse_metrics_rows.get(gname, []))
         gm_df.to_csv(group_summary_csv, index=False)
         if verbose:
             print(f"Saved group summary metrics -> {group_summary_csv}", flush=True)
 
+        # register outputs
+        summary["output_files"].setdefault("group_plots", []).append(group_mean_plot)
+        summary["output_files"].setdefault("group_overlays", []).append(group_all_mice_plot)
+        summary["output_files"].setdefault("group_csvs", []).append(group_summary_csv)
+
     # -------------------
-    # final group comparison across groups: overlay all group means
-    combined_fig_path = os.path.join(event_folder, f"{_safe_name(selected_event)}_group_comparison.png")
+    # final group comparison across groups: overlay all group means with SEM shading
+    combined_fig_path = os.path.join(comparison_root, f"{_safe_name(selected_event)}_group_comparison.png")
     fig, ax = plt.subplots(figsize=(10,6))
-    for gname, mouse_means in per_group_mouse_means.items():
-        if len(mouse_means) == 0:
-            continue
-        arr = np.vstack(mouse_means)
-        g_mean = np.mean(arr, axis=0)
-        ax.plot(peri_times, g_mean, label=gname)
+
+    # reset color cycle to ensure consistent colors between group plots and comparison
+    group_color_cycle = itertools.cycle([
+        "red", "green", "purple", "orange", "brown", "pink", "gray"
+    ])
+
+    for gname, (g_mean, g_sem) in group_means_for_comparison.items():
+        color = next(group_color_cycle)
+        ax.plot(peri_times, g_mean, label=gname, color=color)
+        ax.fill_between(peri_times, g_mean - g_sem, g_mean + g_sem, alpha=0.2, color=color)
+
     ax.axvline(0, color="black", linestyle="--")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("ΔF/F (z-scored baseline)")
     ax.set_title(f"Group comparison — Event: {selected_event}")
-    ax.legend()
+    ax.legend(loc="best", fontsize="small")
     fig.tight_layout()
     fig.savefig(combined_fig_path)
     plt.close(fig)
@@ -532,7 +631,8 @@ def run_batch_processing(
     summary["output_files"].update({
         "event_folder": event_folder,
         "mice_root": mice_root,
-        "groups_root": groups_root
+        "groups_root": groups_root,
+        "comparison_root": comparison_root
     })
 
     # write summary_log.json
@@ -542,5 +642,3 @@ def run_batch_processing(
     summary["output_files"]["summary_log"] = summary_path
     if verbose:
         print(f"Saved summary_log.json -> {summary_path}", flush=True)
-
-    return summary

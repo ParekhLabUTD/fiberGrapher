@@ -9,17 +9,18 @@ import matplotlib.pyplot as plt
 import itertools
 import pandas as pd
 import json
+import matplotlib
 
 from OHRBETsEventExtractor import parse_ohrbets_serial_log
 from nxtEventExtrator import readfile, get_events, get_event_codes
 from sessionInfoExtractor import *
+from batchProcessing import run_batch_processing
+matplotlib.use("Agg")
 
 color_cycle = itertools.cycle([
     "red", "green", "purple", "orange", "brown", "pink", "gray"
 ])
 
-
-import math
 import re
 from datetime import datetime as dt
 from collections import defaultdict
@@ -56,7 +57,6 @@ if "tdt_settings" not in st.session_state:
         "pct_channel": None
     }
 
-
 @st.cache_resource
 def load_tdt_block(path):
     return tdt.read_block(path)
@@ -65,7 +65,7 @@ def get_file_hash(file):
     file.seek(0)
     data = file.read()
     file.seek(0)
-    return hashlib.md5(data).hexdigest()
+    return hashlib.md5(data if isinstance(data, (bytes, bytearray)) else data.encode()).hexdigest()
 
 st.markdown("""
     <style>
@@ -688,262 +688,24 @@ with tab4:
 
     # Processing button
     if st.button("▶️ Run Averaging & Save Plots"):
-        st.info("Starting batch processing... (warnings will appear in server console)")
-
-        # iterate groups -> mice -> sessions
-        for group_name, mice in st.session_state["groups"].items():
-            for mouse_id, sessions in mice.items():
-                for s_path in sessions:
-                    meta = next((m for m in st.session_state["metadata"] if m['path']==s_path and m['mouseID']==mouse_id), None)
-                    if not meta:
-                        print(f"WARNING: metadata missing for session path {s_path}", flush=True)
-                        continue
-
-                    # find event timestamps for selected_event
-                    event_times = [e['timestamp_s'] for e in meta.get("events", []) if e.get("event") == selected_event]
-                    if not event_times:
-                        print(f"WARNING: no '{selected_event}' events in session {s_path} (mouse {mouse_id})", flush=True)
-                        continue
-
-                    # load block
-                    try:
-                        block = load_tdt_block(s_path)
-                    except Exception as e:
-                        print(f"ERROR: failed to read block {s_path}: {e}", flush=True)
-                        continue
-
-                    # pick streams by signalChannelSet using substring match of exact patterns with underscore
-                    scs = meta.get("signalChannelSet", 1)
-                    if scs == 1:
-                        sig_sub, ctrl_sub = "_465A", "_415A"
-                    else:
-                        sig_sub, ctrl_sub = "_465C", "_415C"
-
-                    sig_key = find_stream_by_substr(block, sig_sub)
-                    ctrl_key = find_stream_by_substr(block, ctrl_sub)
-                    if sig_key is None or ctrl_key is None:
-                        print(f"WARNING: cannot find streams for session {s_path} (expected {sig_sub} and {ctrl_sub}).", flush=True)
-                        continue
-
-                    sig = np.asarray(block.streams[sig_key].data).flatten()
-                    ctrl = np.asarray(block.streams[ctrl_key].data).flatten()
-                    fs_orig = float(block.streams[sig_key].fs)
-
-                    if meta.get('interpretor',1) ==2: 
-                        if meta.get('signalChannelSet',1) == 1:
-                            pct_name = 'PtC1'
-                        else:
-                            pct_name = 'PtC2'
-                        onset_list = block.epocs[pct_name].onset
-                        try:
-                            pct_onset = float(onset_list[1])  # confirm this index corresponds to onset
-                            code12_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 12]
-                            if len(code12_times) < 2:
-                                print(f"WARNING: less than 2 code-12 events for session {s_path}; skipping alignment.", flush=True)
-                            else:
-                                offset = pct_onset - code12_times[1]
-                                time_full = np.arange(len(sig)) / fs_orig
-                                time_full -= offset
-                                valid = time_full >= 0
-                                sig = sig[valid]
-                                ctrl = ctrl[valid]
-                        except Exception as e:
-                            print(f"WARNING: alignment failed for {s_path}: {e}", flush=True)
-
-                    # Downsample BEFORE dF/F if requested (simple decimation)
-                    ds = int(downsample_factor)
-                    if ds > 1:
-                        sig = sig[::ds]
-                        ctrl = ctrl[::ds]
-                        fs = fs_orig / ds
-                    else:
-                        fs = fs_orig
-
-                    # Build time vector (seconds)
-                    time_vec = np.arange(len(sig)) / fs
-
-                    # Compute ΔF/F via linear regression (control -> signal)
-                    try:
-                        p = np.polyfit(ctrl, sig, 1)
-                        fitted = p[0] * ctrl + p[1]
-                        dff = 100.0 * (sig - fitted) / (fitted + 1e-12)
-                    except Exception as e:
-                        print(f"ERROR computing regression ΔF/F for {s_path}: {e}", flush=True)
-                        continue
-
-                    # extract peri-event snippets for this session
-                    n_samples = int(round((pre_t + post_t) * fs))
-                    peri_traces = []
-                    peri_times = np.linspace(-pre_t, post_t, n_samples)
-
-                    for ts in event_times:
-                        start_idx = int(round((ts - pre_t) * fs))
-                        end_idx = start_idx + n_samples
-                        if start_idx < 0 or end_idx > len(dff):
-                            print(f"WARNING: event at {ts}s in {s_path} out of bounds after windowing; skipping that trial.", flush=True)
-                            continue
-                        snippet = dff[start_idx:end_idx].astype(float)
-
-                        # baseline z-score using baseline_lower..baseline_upper
-                        bstart = int(round((ts + baseline_lower) * fs))
-                        bend = int(round((ts + baseline_upper) * fs))
-                        bstart = max(0, bstart)
-                        bend = min(len(dff), bend)
-                        if bend > bstart:
-                            baseline_vals = dff[bstart:bend]
-                            mu = np.mean(baseline_vals)
-                            sigma = np.std(baseline_vals)
-                            if sigma > 0:
-                                snippet = (snippet - mu) / sigma
-                            else:
-                                snippet = snippet - mu
-                        else:
-                            # if baseline invalid, subtract global mean
-                            mu = np.mean(dff)
-                            snippet = snippet - mu
-
-                        peri_traces.append(snippet)
-
-                        # compute metrics per trial (peak, auc, latency) over metric window
-                        mstart_idx = int(round((pre_t + metric_start) * fs))
-                        mend_idx = int(round((pre_t + metric_end) * fs))
-                        # ensure indices in bounds
-                        mstart_idx = max(0, mstart_idx)
-                        mend_idx = min(len(snippet), mend_idx)
-                        if mend_idx > mstart_idx:
-                            post_segment = snippet[mstart_idx:mend_idx]
-                            peak = float(np.max(post_segment))
-                            auc = float(np.trapz(post_segment, dx=1.0/fs))
-                            latency_idx = int(np.argmax(post_segment))
-                            latency = float((latency_idx) / fs + metric_start)  # relative to T0
-                        else:
-                            peak, auc, latency = np.nan, np.nan, np.nan
-
-                        all_metrics.append({
-                            "group": group_name,
-                            "mouse": mouse_id,
-                            "session": os.path.basename(s_path),
-                            "event_time": ts,
-                            "peak": peak,
-                            "auc": auc,
-                            "latency": latency
-                        })
-
-                    if len(peri_traces) == 0:
-                        print(f"WARNING: no valid peri-event snippets for session {s_path}", flush=True)
-                        continue
-
-                    peri_traces = np.vstack(peri_traces)  # trials x samples
-                    session_mean = np.mean(peri_traces, axis=0)
-                    session_sem = peri_traces.std(axis=0) / np.sqrt(peri_traces.shape[0])
-
-                    # Save per-session plot (and also store for mouse-level averaging)
-                    ev_folder = os.path.join(plots_base, _safe_name(selected_event))
-                    sess_folder = os.path.join(ev_folder, "per_mouse_sessions", _safe_name(group_name), _safe_name(mouse_id))
-                    os.makedirs(sess_folder, exist_ok=True)
-                    sess_fname = f"{_safe_name(mouse_id)}_{_safe_name(os.path.basename(s_path))}_session_avg.png"
-                    sess_path = os.path.join(sess_folder, sess_fname)
-
-                    fig, ax = plt.subplots(figsize=(6,4))
-                    ax.plot(peri_times, session_mean, color="blue")
-                    ax.fill_between(peri_times, session_mean - session_sem, session_mean + session_sem, alpha=0.3)
-                    ax.axvline(0, color="red", linestyle="--")
-                    ax.set_title(f"{group_name} | {mouse_id} | {os.path.basename(s_path)}")
-                    ax.set_xlabel("Time (s)")
-                    ax.set_ylabel("ΔF/F (z-scored baseline)")
-                    fig.tight_layout()
-                    fig.savefig(sess_path)
-                    plt.close(fig)
-
-                    per_mouse_session_traces[mouse_id].append(session_mean)
-                    per_mouse_session_info[mouse_id].append((group_name, os.path.basename(s_path)))
-
-                # end sessions loop for this mouse
-            # end mice loop for this group
-        # end groups loop
-
-        # --- Per-mouse averages and saving per-mouse plots (including each session plot already saved) ---
-        mouse_avg_folder = os.path.join(plots_base, _safe_name(selected_event), "per_mouse_avgs")
-        os.makedirs(mouse_avg_folder, exist_ok=True)
-
-        per_group_mean_traces = defaultdict(list)  # group -> list of mean traces from mice
-
-        for mouse_id, traces in per_mouse_session_traces.items():
-            if not traces:
-                continue
-            # average across sessions for that mouse
-            traces_arr = np.vstack(traces)  # sessions x samples
-            mouse_mean = np.mean(traces_arr, axis=0)
-            mouse_sem = traces_arr.std(axis=0) / math.sqrt(traces_arr.shape[0])
-
-            # save mouse average
-            mouse_fname = f"{_safe_name(mouse_id)}_avg.png"
-            mouse_path = os.path.join(mouse_avg_folder, mouse_fname)
-            fig, ax = plt.subplots(figsize=(6,4))
-            ax.plot(peri_times, mouse_mean, color="green")
-            ax.fill_between(peri_times, mouse_mean - mouse_sem, mouse_mean + mouse_sem, alpha=0.3)
-            ax.axvline(0, color="red", linestyle="--")
-            ax.set_title(f"Mouse avg: {mouse_id}")
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel("ΔF/F (z-scored baseline)")
-            fig.tight_layout()
-            fig.savefig(mouse_path)
-            plt.close(fig)
-
-            # find group(s) for this mouse (a mouse may be assigned to a single group in UI)
-            # We will attach this mouse_mean to each group it belongs to
-            for gname, mice in st.session_state["groups"].items():
-                if mouse_id in mice:
-                    per_group_mean_traces[gname].append(mouse_mean)
-
-        # --- Per-group averages and saving ---
-        group_avg_folder = os.path.join(plots_base, _safe_name(selected_event), "per_group_avgs")
-        os.makedirs(group_avg_folder, exist_ok=True)
-        combined_fig, combined_ax = plt.subplots(figsize=(8,5))
-
-        color_iter = itertools.cycle(["red","blue","green","orange","purple","brown","cyan"])
-        for gname, mouse_means in per_group_mean_traces.items():
-            if not mouse_means:
-                print(f"WARNING: no mouse means for group {gname}", flush=True)
-                continue
-            arr = np.vstack(mouse_means)  # mice x samples
-            g_mean = np.mean(arr, axis=0)
-            g_sem = arr.std(axis=0) / math.sqrt(arr.shape[0])
-
-            # save group avg plot
-            g_fname = f"{_safe_name(gname)}_avg.png"
-            g_path = os.path.join(group_avg_folder, g_fname)
-            fig, ax = plt.subplots(figsize=(6,4))
-            ax.plot(peri_times, g_mean, label=gname)
-            ax.fill_between(peri_times, g_mean - g_sem, g_mean + g_sem, alpha=0.3)
-            ax.axvline(0, color="red", linestyle="--")
-            ax.set_title(f"Group avg: {gname}")
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel("ΔF/F (z-scored baseline)")
-            fig.tight_layout()
-            fig.savefig(g_path)
-            plt.close(fig)
-
-            # add to combined comparison plot
-            color = next(color_iter)
-            combined_ax.plot(peri_times, g_mean, label=gname, color=color)
-            combined_ax.fill_between(peri_times, g_mean - g_sem, g_mean + g_sem, alpha=0.15, color=color)
-
-        combined_ax.axvline(0, color="black", linestyle="--")
-        combined_ax.set_xlabel("Time (s)")
-        combined_ax.set_ylabel("ΔF/F (z-scored baseline)")
-        combined_ax.set_title(f"Group comparison — Event: {selected_event}")
-        combined_ax.legend()
-        combined_path = os.path.join(plots_base, _safe_name(selected_event), f"{_safe_name(selected_event)}_group_comparison.png")
-        combined_fig.tight_layout()
-        combined_fig.savefig(combined_path)
-        plt.close(combined_fig)
-
-        # --- Save metrics CSV ---
-        metrics_df = pd.DataFrame(all_metrics)
-        metrics_fname = f"photometry_metrics_{_safe_name(selected_event)}_{timestamp_str}.csv"
-        metrics_path = os.path.join(plots_base, _safe_name(selected_event), metrics_fname)
-        metrics_df.to_csv(metrics_path, index=False)
-
-        st.success(f"Processing complete. Plots and metrics saved to: {os.path.join(plots_base, _safe_name(selected_event))}")
-        print(f"Saved plots & metrics at {os.path.join(plots_base, _safe_name(selected_event))}", flush=True)
+        with st.spinner("Running batch processing..."):
+            try:
+                summary = run_batch_processing(
+                base_path=path,
+                selected_event=selected_event,
+                pre_t=pre_t, post_t=post_t,
+                baseline_lower=baseline_lower, baseline_upper=baseline_upper,
+                downsample_factor=downsample_factor,
+                metric_start=metric_start, metric_end=metric_end,
+                metadata_list=st.session_state.get("metadata", []),
+                groups_dict=st.session_state.get("groups", {}),
+                find_stream_by_substr=find_stream_by_substr,
+                load_tdt_block=load_tdt_block,
+                verbose=True
+            )
+                st.success(f"Processing complete. Output folder: {summary['output_files']['event_folder']}")
+                st.write(summary)  # visible run summary in the UI
+            except Exception as e:
+                st.error(f"Processing failed: {e}")
+                import traceback
+                st.text(traceback.format_exc())
