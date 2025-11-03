@@ -65,6 +65,9 @@ def run_batch_processing(
     per_mouse_pooled_trials = defaultdict(list)   # mouse_id -> list of 1D arrays (trials)
     per_mouse_session_counts = defaultdict(int)
     per_mouse_summary_metrics = defaultdict(list) # mouse -> list of dicts (trial-level metrics) for mouse_summary later
+    per_mouse_pooled_trials_by_group = defaultdict(lambda: defaultdict(list))
+    per_mouse_summary_metrics_by_group = defaultdict(lambda: defaultdict(list))
+
 
     # flags for plotting
     color_cycle = itertools.cycle([
@@ -194,7 +197,7 @@ def run_batch_processing(
                     p = np.polyfit(ctrl, sig, 1)
                     fitted = p[0] * ctrl + p[1]
                     dff = 100.0 * (sig - fitted) / (fitted + 1e-12)
-                except Exception as e:
+                except Exception as e: 
                     err = f"regression_dff_failed: {e}"
                     print("ERROR:", err, flush=True)
                     summary["errors"].append({"session": s_path, "error": err})
@@ -344,10 +347,20 @@ def run_batch_processing(
                     print(f"Saved session metrics -> {session_metrics_path}", flush=True)
 
                 # append session-level traces to per-mouse pooled list (z-scored trials used)
+                # append session-level traces to global per-mouse pool (used for mouse-combined outputs)
                 for tr in peri_traces:
                     per_mouse_pooled_trials[mouse_id].append(tr)
+
+                # ALSO append the same session trials to the group-specific pool so group averages only include sessions assigned to this group
+                # group_name is available in this scope (from the outer loop)
+                for tr in peri_traces:
+                    per_mouse_pooled_trials_by_group[group_name][mouse_id].append(tr)
+
                 per_mouse_session_counts[mouse_id] += 1
+
+                # metrics: keep global and per-group trial metric rows
                 per_mouse_summary_metrics[mouse_id].extend(session_metric_rows)
+                per_mouse_summary_metrics_by_group[group_name][mouse_id].extend(session_metric_rows)
 
                 processed_sessions.add(s_path)
 
@@ -362,9 +375,45 @@ def run_batch_processing(
     # per_group_mouse_means: group -> list of arrays (mouse means)
     # per_group_mouse_metrics_rows: group -> list of dict rows (contain 'mouse' field)
     # These were filled earlier. We'll assume their order matches.
+    # Build per_group_mouse_means from per_mouse_pooled_trials_by_group
+    per_group_mouse_means = defaultdict(list)
+    per_group_mouse_metrics_rows = defaultdict(list)
 
-    per_group_mouse_means_fixed = defaultdict(list)
-    per_group_mouse_metrics_rows_fixed = defaultdict(list)
+    for gname, mice_map in groups_dict.items():
+        for mouse_id in mice_seen:
+            trials = per_mouse_pooled_trials_by_group[gname].get(mouse_id, [])
+            if not trials:
+                continue
+            # stack trials (already z-scored per session)
+            trials_arr = np.vstack(trials)   # trials x samples
+            mouse_mean = np.mean(trials_arr, axis=0)
+            mouse_sem = trials_arr.std(axis=0) / math.sqrt(trials_arr.shape[0])
+
+            # store for group-level aggregation
+            per_group_mouse_means[gname].append(mouse_mean)
+
+            # prepare per-mouse metrics for this group (per-mouse summary collapsed across the group's trials)
+            mouse_metrics_rows = per_mouse_summary_metrics_by_group[gname].get(mouse_id, [])
+            if len(mouse_metrics_rows) > 0:
+                mdf = pd.DataFrame(mouse_metrics_rows)
+                mean_peak = float(mdf["peak"].mean(skipna=True))
+                mean_auc = float(mdf["auc"].mean(skipna=True))
+                mean_latency = float(mdf["latency"].mean(skipna=True))
+                n_trials = int(len(mdf))
+            else:
+                mean_peak = mean_auc = mean_latency = np.nan
+                n_trials = 0
+
+            per_group_mouse_metrics_rows[gname].append({
+                "group": gname,
+                "mouse": mouse_id,
+                "mean_peak": mean_peak,
+                "mean_auc": mean_auc,
+                "mean_latency": mean_latency,
+                "n_trials": n_trials
+            })
+
+    
         # ---- DEBUG DUMP (insert here) ----
     import hashlib
 
@@ -477,8 +526,28 @@ def run_batch_processing(
             print(f"Saved mouse combined plot -> {mouse_combined_plot}", flush=True)
 
         # attach mouse mean to each group it belongs to (preserve order for later zipping)
-        for gname, mice in groups_dict.items():
-            if mouse_id in mice:
+# --- robust attach of mouse means to groups (replace previous membership test) ---
+'''
+        norm_id = lambda s: str(s).strip().lower()
+
+        for gname, mice_map in groups_dict.items():
+            # build normalized set of mouse keys for this group
+            try:
+                if isinstance(mice_map, dict):
+                    group_mouse_keys = {norm_id(k) for k in mice_map.keys()}
+                elif isinstance(mice_map, (list, tuple, set)):
+                    # could be list of mouse IDs or list of session paths; try both
+                    group_mouse_keys = {norm_id(k) for k in mice_map}
+                else:
+                    # fallback: try to get keys() then fallback to string-cast
+                    try:
+                        group_mouse_keys = {norm_id(k) for k in mice_map.keys()}
+                    except Exception:
+                        group_mouse_keys = {norm_id(str(mice_map))}
+            except Exception:
+                group_mouse_keys = set()
+
+            if norm_id(mouse_id) in group_mouse_keys:
                 per_group_mouse_means_fixed[gname].append(mouse_mean)
                 per_group_mouse_metrics_rows_fixed[gname].append({
                     "group": gname,
@@ -488,6 +557,9 @@ def run_batch_processing(
                     "mean_latency": mean_latency,
                     "n_trials": n_trials
                 })
+                if verbose:
+                    print(f"Assigned mouse {mouse_id} -> group {gname}", flush=True)
+'''
 
     # Replace the originals with the fixed structures for plotting below
     per_group_mouse_means = per_group_mouse_means_fixed
