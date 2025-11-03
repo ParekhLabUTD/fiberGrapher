@@ -190,6 +190,12 @@ def run_batch_processing(
 
                 if verbose:
                     print(f"After downsampling: sig_len={len(sig)}, fs={fs}", flush=True)
+                min_len = min(len(sig), len(ctrl))
+                if len(sig) != len(ctrl):
+                    if verbose:
+                        print(f"Signal/control length mismatch: sig={len(sig)}, ctrl={len(ctrl)}. Truncating to {min_len}.", flush=True)
+                    sig = sig[:min_len]
+                    ctrl = ctrl[:min_len]
 
                 try:
                     p = np.polyfit(ctrl, sig, 1)

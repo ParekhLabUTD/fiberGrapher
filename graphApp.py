@@ -148,6 +148,11 @@ with tab3:
                 control = control[::downsample_factor]
                 fs = fs / downsample_factor
 
+            min_len = min(len(signal), len(control))
+            if len(signal) != len(control):
+                signal = signal[:min_len]
+                control = control[:min_len]
+
             # ΔF/F calculation
             fit = np.polyfit(control, signal, 1)
             fitted = fit[0] * control + fit[1]
@@ -419,6 +424,12 @@ with tab2:
             time = time[valid]
             signal_ds = signal_ds[valid]
             control_ds = control_ds[valid]
+
+            min_len = min(len(signal), len(control))
+            if len(signal) != len(control):
+                signal = signal[:min_len]
+                control = control[:min_len]
+
 
             fit = np.polyfit(control_ds,signal_ds, 1)
             fitted = fit[0] * control_ds + fit[1]
