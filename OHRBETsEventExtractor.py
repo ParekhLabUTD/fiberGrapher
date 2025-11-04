@@ -27,7 +27,7 @@ def parse_ohrbets_serial_log(file_path):
         i+=1
         if code in code_map:
             event_name = code_map[code]
-            timestamp_s = float(data[i][1])/1000
+            timestamp_s = float(data[i-1][1])/1000
 
             events.append({
                     'code': code,

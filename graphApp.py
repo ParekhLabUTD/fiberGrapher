@@ -406,11 +406,14 @@ with tab2:
         if "extracted_data" not in st.session_state:
             st.error("❌ No TDT data loaded. Please use the Data Extractor tab.")
             st.stop()
-
         data = st.session_state.extracted_data
-        pct_onset = data["pct"][1]              # or however your PCT onset is stored
-        code12_times = [e["timestamp_s"] for e in data["events"] if e["code"] == 12]
-        offset = pct_onset - code12_times[1]
+        try:
+            pct_onset = data["pct"][1]              # or however your PCT onset is stored
+            code12_times = [e["timestamp_s"] for e in data["events"] if e["code"] == 12]
+            offset = pct_onset - code12_times[1]
+        except:
+            #add logic when skipping the pct line up
+            offset
 
         fig = go.Figure()
 
