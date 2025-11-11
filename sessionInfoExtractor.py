@@ -78,6 +78,7 @@ def add_events_to_sessions(metadata):
             print("not made yet")
         elif data['event_interpretor'] == 2:
             data['events']  = parse_ohrbets_serial_log(data['event_file_path'])
+            data['events'] = lickBoutFilter(data['events'])
         else:
             data_temp = readfile(data['event_file_path'])
             code_map = {

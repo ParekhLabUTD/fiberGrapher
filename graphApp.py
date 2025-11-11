@@ -366,6 +366,9 @@ with tab1:
             if submitted:
                 st.session_state.code_map = updated_map
                 st.success("Code map updated.")
+    if st.button("lick filtering"):
+        st.session_state["extracted_data"]["events"] = lickBoutFilter(st.session_state["extracted_data"]["events"])
+        st.success("Lick bouts are implemented.")        
 
 # =====================
 # TAB 2: Graph Viewer
@@ -376,7 +379,7 @@ with tab2:
     downsample_factor = st.number_input("Downsampling factor", min_value=1, value=100)
     cutoff_time_from_pct = st.checkbox("Use PCT's 2nd event (code 12) to align all events?", value=False)
     if cutoff_time_from_pct:
-        cutoff_time = st.session_state["extracted_data"]["pct"][1]
+        cutoff_time = 0
     else:
         cutoff_time = st.number_input("Start time (seconds)", min_value=0.0, value=2.0)
 
@@ -408,12 +411,12 @@ with tab2:
             st.stop()
         data = st.session_state.extracted_data
         try:
-            pct_onset = data["pct"][1]              # or however your PCT onset is stored
+            pct_onset = data["pct"][1]
             code12_times = [e["timestamp_s"] for e in data["events"] if e["code"] == 12]
             offset = pct_onset - code12_times[1]
         except:
             #add logic when skipping the pct line up
-            offset
+            offset=cutoff_time
 
         fig = go.Figure()
 
