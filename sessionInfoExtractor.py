@@ -101,7 +101,7 @@ def split_combined_mouse_ids(session_info):
     expanded_sessions = []
     for entry in session_info:
         # Split by underscore if it seems like multiple mouse IDs
-        if ("M" in entry["mouseID"] or "F" in entry["mouseID"]) and "_" in entry["mouseID"]:
+        if ("M"  in entry["mouseID"]or "m" in entry["mouseID"] or "F"  in entry["mouseID"] or "f" in entry["mouseID"]) and "_" in entry["mouseID"]:
             mouse_ids = entry["mouseID"].split("_")
             channel_ind = 1
             for mid in mouse_ids:
