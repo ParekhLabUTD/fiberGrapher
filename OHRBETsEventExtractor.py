@@ -7,7 +7,10 @@ code_map = {
     15: 'spout retracted',
     12: 'brake disengaged',
     688: 'lick onset',
-    689: 'lick offset'
+    689: 'lick offset',
+    401: 'infusion start',
+    402: 'infusion end',
+    432: 'timeout end'
 }
 
 def extract_code(cell):
@@ -90,3 +93,8 @@ def lickBoutFilter(events):
             events[last_idx]["event"] = "lick offset"
 
     return events
+
+
+def TurnBoutfilter(events):
+    # takes events list, and then check for first 81, then tally 81s until 71 is detected. reset 81 count, tally 71s. If count of 81s or 71s 
+    return
