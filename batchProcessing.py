@@ -98,6 +98,8 @@ def run_batch_processing(
         print("=" * 50 + "\n")
 
     all_trial_rows = []
+    all_trace_dfs = []  
+
     summary = {
         "run_timestamp": timestamp_str,
         "n_groups": 0,
@@ -376,6 +378,45 @@ def run_batch_processing(
                 peri_arr = np.vstack(peri_traces)
                 session_mean = np.mean(peri_arr, axis=0)
                 session_sem = peri_arr.std(axis=0) / math.sqrt(peri_arr.shape[0])
+                session_traces_long_csv = os.path.join(
+                    mouse_folder, f"{session_basename}_peri_event_traces_LONG.csv"
+                )
+
+                n_trials, n_tp = peri_arr.shape
+
+                df_long = pd.DataFrame({
+                    # trial index (1-based, consistent with metrics)
+                    "trial_index": np.repeat(np.arange(1, n_trials + 1), n_tp),
+
+                    # stable integer index for reshaping/pivoting later
+                    "time_idx": np.tile(np.arange(n_tp), n_trials),
+
+                    # real peri-event time vector (no rounding)
+                    "time_s": np.tile(peri_times, n_trials),
+
+                    # signal value (already baseline-normalized / z-scored)
+                    "signal_z": peri_arr.reshape(-1)
+                })
+
+                # Attach mouse/session identifiers (CRITICAL for dual-mouse)
+                df_long["mouse"] = mouse_id
+                df_long["group"] = group_name
+                df_long["session"] = os.path.basename(s_path)
+                df_long["fs"] = fs
+                df_long["signalChannelSet"] = scs
+
+                df_long.to_csv(session_traces_long_csv, index=False)
+
+                summary["output_files"].setdefault(
+                    "peri_event_long_csvs", []
+                ).append(session_traces_long_csv)
+
+                # collect for optional master export
+                all_trace_dfs.append(df_long)
+
+                if verbose:
+                    print(f"Saved peri-event LONG traces -> {session_traces_long_csv}", flush=True)
+
 
                 fig, ax = plt.subplots(figsize=(6,4))
                 ax.plot(peri_times, session_mean)
@@ -644,6 +685,17 @@ def run_batch_processing(
     else:
         if verbose:
             print("No trial rows collected; master trial CSV not created.", flush=True)
+
+    if len(all_trace_dfs) > 0:
+        all_traces_df = pd.concat(all_trace_dfs, ignore_index=True)
+        all_traces_csv = os.path.join(
+            event_folder, "all_groups_peri_event_traces_LONG.csv"
+        )
+        all_traces_df.to_csv(all_traces_csv, index=False)
+        summary["output_files"]["all_groups_peri_event_traces_LONG_csv"] = all_traces_csv
+        if verbose:
+            print(f"Saved MASTER peri-event LONG traces -> {all_traces_csv}", flush=True)
+
 
     # Also save per-mouse Prism tables (global combined)
     for mouse_id, trials in per_mouse_pooled_trials.items():
