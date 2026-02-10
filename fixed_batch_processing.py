@@ -31,31 +31,6 @@ def load_tdt_block(path):
         raise RuntimeError("tdt library not available. Install tdt or provide a custom loader.") from e
     return tdt.read_block(path)
 
-# Prism export helpers
-def save_prism_xy(time_array, mean_array, sem_array, out_path):
-    """
-    Save a three-column XY table (time, mean, sem) suitable for Prism XY.
-    No rounding (full float precision).
-    """
-    df = pd.DataFrame({
-        "time_s": time_array,
-        "mean": mean_array,
-        "sem": sem_array
-    })
-    df.to_csv(out_path, index=False)
-
-def save_prism_multigroup(time_array, group_mean_dict, group_sem_dict, out_path):
-    """
-    Save a multi-group table with columns:
-    time_s, <group1>_mean, <group1>_sem, <group2>_mean, <group2>_sem, ...
-    """
-    cols = {"time_s": time_array}
-    for g in group_mean_dict:
-        cols[f"{g}_mean"] = group_mean_dict[g]
-        cols[f"{g}_sem"] = group_sem_dict[g]
-    df = pd.DataFrame(cols)
-    df.to_csv(out_path, index=False)
-
 def run_batch_processing(
     base_path,
     selected_event,
@@ -73,16 +48,12 @@ def run_batch_processing(
     event_folder = os.path.join(base_path, "plots", f"{_safe_name(selected_event)}_{timestamp_str}")
     mice_root = os.path.join(event_folder, "mice")
     groups_root = os.path.join(event_folder, "groups")
-    prism_root = os.path.join(event_folder, "prism_tables")
-    prism_sessions = os.path.join(prism_root, "sessions")
-    prism_mice = os.path.join(prism_root, "mice")
-    prism_groups = os.path.join(prism_root, "groups")
-    prism_comparison = os.path.join(prism_root, "comparison")
-
-    for p in [mice_root, groups_root, prism_sessions, prism_mice, prism_groups, prism_comparison]:
-        os.makedirs(p, exist_ok=True)
+    os.makedirs(mice_root, exist_ok=True)
+    os.makedirs(groups_root, exist_ok=True)
 
     def norm(p): return os.path.normpath(p)
+    
+    # Create a lookup that maps (path, mouseID) -> metadata entry
     # This is CRITICAL for dual-mouse sessions
     meta_lookup = {}
     for m in (metadata_list or []):
@@ -98,8 +69,6 @@ def run_batch_processing(
         print("=" * 50 + "\n")
 
     all_trial_rows = []
-    all_trace_dfs = []  
-
     summary = {
         "run_timestamp": timestamp_str,
         "n_groups": 0,
@@ -116,12 +85,11 @@ def run_batch_processing(
     mice_seen = set()
     groups_seen = set()
 
-    per_mouse_pooled_trials = defaultdict(list)   # mouse -> list of trial arrays (all sessions)
+    per_mouse_pooled_trials = defaultdict(list)
     per_mouse_session_counts = defaultdict(int)
-    per_mouse_summary_metrics = defaultdict(list) # global per-mouse trial rows
+    per_mouse_summary_metrics = defaultdict(list)
 
-    # NEW: per-group per-mouse pools so group means only use sessions assigned to that group
-    per_mouse_pooled_trials_by_group = defaultdict(lambda: defaultdict(list))  # group -> mouse -> list of trial arrays
+    per_mouse_pooled_trials_by_group = defaultdict(lambda: defaultdict(list))
     per_mouse_summary_metrics_by_group = defaultdict(lambda: defaultdict(list))
 
     color_cycle = itertools.cycle([
@@ -129,6 +97,7 @@ def run_batch_processing(
     ])
 
     summary["n_groups"] = len(groups_dict or {})
+    
     for group_name, mice in (groups_dict or {}).items():
         groups_seen.add(group_name)
         for mouse_id, session_paths in (mice or {}).items():
@@ -136,9 +105,10 @@ def run_batch_processing(
             for s_path in session_paths:
                 summary["n_sessions"] += 1
                 if verbose:
-                    print(f"\n--- Processing block ---", flush=True)
-                    print(f"Group: {group_name} | Mouse: {mouse_id}", flush=True)
-                    print(f"Session path: {s_path}", flush=True)
+                    print(f"\n{'='*60}")
+                    print(f"Processing: Group={group_name} | Mouse={mouse_id}")
+                    print(f"Session: {s_path}")
+                    print('='*60)
 
                 norm_path = norm(s_path)
                 
@@ -168,11 +138,12 @@ def run_batch_processing(
                 
                 if verbose:
                     print(f"Using channels: Signal={sig_sub}, Control={ctrl_sub}")
+
                 try:
                     block = load_tdt_block(s_path)
                 except Exception as e:
                     err = f"failed_to_load_block: {e}"
-                    print("ERROR:", err, flush=True)
+                    print(f"ERROR: {err}")
                     summary["errors"].append({"session": s_path, "error": err})
                     continue
 
@@ -180,16 +151,23 @@ def run_batch_processing(
                     avail_streams = list(block.streams.keys())
                 except Exception:
                     avail_streams = []
+                
                 if verbose:
-                    print(f"Loaded block: {s_path}", flush=True)
-                    print("Available stream keys:", avail_streams, flush=True)
+                    print(f"Available streams: {avail_streams}")
 
                 sig_key = find_stream_by_substr(block, sig_sub)
                 ctrl_key = find_stream_by_substr(block, ctrl_sub)
+                
                 if sig_key is None or ctrl_key is None:
-                    err = f"streams_missing expected {sig_sub} / {ctrl_sub}"
-                    print("WARNING:", err, "available:", avail_streams, flush=True)
-                    summary["errors"].append({"session": s_path, "error": err, "available_streams": avail_streams})
+                    err = f"streams_missing: expected {sig_sub}/{ctrl_sub}"
+                    print(f"ERROR: {err}")
+                    print(f"  Available: {avail_streams}")
+                    summary["errors"].append({
+                        "session": s_path, 
+                        "mouse": mouse_id,
+                        "error": err, 
+                        "available_streams": avail_streams
+                    })
                     continue
 
                 try:
@@ -198,18 +176,20 @@ def run_batch_processing(
                     fs_orig = float(block.streams[sig_key].fs)
                 except Exception as e:
                     err = f"failed_extract_streams: {e}"
-                    print("ERROR:", err, flush=True)
+                    print(f"ERROR: {err}")
                     summary["errors"].append({"session": s_path, "error": err})
                     continue
 
                 if verbose:
-                    print(f"Signal key: {sig_key}, Control key: {ctrl_key}", flush=True)
-                    print(f"Signal len={len(sig)}, Control len={len(ctrl)}, Fs_orig={fs_orig}", flush=True)
+                    print(f"Extracted: {sig_key} (len={len(sig)}), {ctrl_key} (len={len(ctrl)}), Fs={fs_orig}")
 
+                # Get events for THIS mouse from the metadata
                 event_times = [e['timestamp_s'] for e in meta.get("events", []) if e.get("event") == selected_event]
+                
+                # Alignment logic
                 try:
                     if meta.get('interpretor', 1) == 2:
-                        pct_name = 'PtC1' if meta.get('signalChannelSet',1) == 1 else 'PtC2'
+                        pct_name = 'PtC1' if scs == 1 else 'PtC2'
                         onset_list = None
                         try:
                             onset_list = block.epocs[pct_name].onset
@@ -226,19 +206,20 @@ def run_batch_processing(
                             ctrl = ctrl[valid]
                             event_times = [t - offset for t in event_times]
                             if verbose:
-                                print(f"Alignment applied. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
+                                print(f"Alignment: offset={offset:.3f}s, samples after trim={len(sig)}")
                         else:
                             if verbose:
-                                print("Alignment conditions not met (onset/code12); skipping alignment", flush=True)
+                                print("Alignment conditions not met; skipping")
                 except Exception as e:
-                    print("WARNING: alignment failed:", e, flush=True)
+                    print(f"WARNING: alignment failed: {e}")
 
                 if len(event_times) == 0:
-                    warn = f"no '{selected_event}' events in session {s_path}"
-                    print("WARNING:", warn, flush=True)
-                    summary["errors"].append({"session": s_path, "error": warn})
+                    warn = f"no '{selected_event}' events for mouse {mouse_id}"
+                    print(f"WARNING: {warn}")
+                    summary["errors"].append({"session": s_path, "mouse": mouse_id, "error": warn})
                     continue
 
+                # Downsampling
                 ds = int(downsample_factor)
                 if ds > 1:
                     sig = sig[::ds]
@@ -247,69 +228,69 @@ def run_batch_processing(
                 else:
                     fs = fs_orig
 
-                if verbose:
-                    print(f"After downsampling: sig_len={len(sig)}, fs={fs}", flush=True)
-
-                # --- Safe truncation before regression ---
+                # Length matching
                 min_len = min(len(sig), len(ctrl))
                 if len(sig) != len(ctrl):
                     if verbose:
-                        print(f"Signal/control length mismatch: sig={len(sig)}, ctrl={len(ctrl)}. Truncating to {min_len}.", flush=True)
+                        print(f"Length mismatch: sig={len(sig)}, ctrl={len(ctrl)}. Truncating to {min_len}")
                     sig = sig[:min_len]
                     ctrl = ctrl[:min_len]
 
+                # dF/F calculation
                 try:
                     p = np.polyfit(ctrl, sig, 1)
                     fitted = p[0] * ctrl + p[1]
                     dff = 100.0 * (sig - fitted) / (fitted + 1e-12)
                 except Exception as e:
                     err = f"regression_dff_failed: {e}"
-                    print("ERROR:", err, flush=True)
+                    print(f"ERROR: {err}")
                     summary["errors"].append({"session": s_path, "error": err})
                     continue
 
                 if verbose:
-                    print(f"Computed dF/F len={len(dff)} mean={np.mean(dff):.3f} std={np.std(dff):.3f}", flush=True)
+                    print(f"dF/F: len={len(dff)}, mean={np.mean(dff):.3f}, std={np.std(dff):.3f}")
 
+                # Peri-event window setup
                 n_samples = int(round((pre_t + post_t) * fs))
                 if n_samples <= 0:
-                    err = f"invalid n_samples computed: {(pre_t+post_t)}*{fs} -> {n_samples}"
-                    print("ERROR:", err, flush=True)
+                    err = f"invalid n_samples: {n_samples}"
+                    print(f"ERROR: {err}")
                     summary["errors"].append({"session": s_path, "error": err})
                     continue
                 peri_times = (np.arange(n_samples) / fs) - pre_t
 
-                if verbose:
-                    print(f"Peri window samples: {n_samples}, peri_times[0:3]={peri_times[:3]}", flush=True)
-
+                # Create output folders
                 mouse_folder = os.path.join(mice_root, _safe_name(mouse_id))
                 os.makedirs(mouse_folder, exist_ok=True)
                 session_basename = _safe_name(os.path.basename(s_path))
                 session_plot_path = os.path.join(mouse_folder, f"{session_basename}_session_avg.png")
                 session_metrics_path = os.path.join(mouse_folder, f"{session_basename}_metrics.csv")
-                session_prism_csv = os.path.join(prism_sessions, f"{_safe_name(mouse_id)}_{session_basename}_prism.csv")
 
                 peri_traces = []
                 session_metric_rows = []
                 trial_index = 0
 
+                # Extract trials
                 for ts in event_times:
                     start_idx = int(round((ts - pre_t) * fs))
                     end_idx = start_idx + n_samples
                     trial_index += 1
+                    
                     if start_idx < 0 or end_idx > len(dff):
                         if verbose:
-                            print(f"  Skip trial {trial_index}: start={start_idx} end={end_idx} out of bounds (len={len(dff)})", flush=True)
+                            print(f"  Skip trial {trial_index}: out of bounds")
                         summary["invalid_trials"] += 1
                         summary["n_trials_total"] += 1
                         continue
 
                     snippet = dff[start_idx:end_idx].astype(float)
 
+                    # Baseline z-scoring
                     bstart_rel = int(round((baseline_lower + pre_t) * fs))
                     bend_rel = int(round((baseline_upper + pre_t) * fs))
                     bstart_rel = max(0, bstart_rel)
                     bend_rel = min(len(snippet), bend_rel)
+                    
                     if bend_rel > bstart_rel:
                         baseline_vals = snippet[bstart_rel:bend_rel]
                         mu = float(np.mean(baseline_vals))
@@ -337,6 +318,7 @@ def run_batch_processing(
                             snippet_z = snippet - mu
                             zscored_flag = False
 
+                    # Compute metrics
                     mstart_idx = int(round((pre_t + metric_start) * fs))
                     mend_idx = int(round((pre_t + metric_end) * fs))
                     mstart_idx = max(0, mstart_idx)
@@ -363,7 +345,7 @@ def run_batch_processing(
                         "n_timepoints": len(snippet_z),
                         "zscored": bool(zscored_flag),
                         "fs": fs,
-                        "signalChannelSet": scs
+                        "signalChannelSet": scs  # Track which channel was used
                     })
 
                     all_trial_rows.append(session_metric_rows[-1])
@@ -371,93 +353,37 @@ def run_batch_processing(
                     summary["valid_trials"] += 1
 
                 if len(peri_traces) == 0:
-                    print(f"WARNING: no valid peri-event snippets for session {s_path}", flush=True)
-                    summary["errors"].append({"session": s_path, "error": "no_valid_trials"})
+                    print(f"WARNING: no valid trials for {mouse_id} in {s_path}")
+                    summary["errors"].append({"session": s_path, "mouse": mouse_id, "error": "no_valid_trials"})
                     continue
 
+                # Plot session average
                 peri_arr = np.vstack(peri_traces)
                 session_mean = np.mean(peri_arr, axis=0)
                 session_sem = peri_arr.std(axis=0) / math.sqrt(peri_arr.shape[0])
-                session_traces_long_csv = os.path.join(
-                    mouse_folder, f"{session_basename}_peri_event_traces_LONG.csv"
-                )
-
-                n_trials, n_tp = peri_arr.shape
-                global_time_s = []
-
-                for ts in event_times[:n_trials]:
-                    peri_global = ts + peri_times
-                    global_time_s.extend(peri_global)
-
-
-                df_long = pd.DataFrame({
-                    # trial index (1-based, consistent with metrics)
-                    "trial_index": np.repeat(np.arange(1, n_trials + 1), n_tp),
-                    "global_time_s": global_time_s,
-
-                    # stable integer index for reshaping/pivoting later
-                    "time_idx": np.tile(np.arange(n_tp), n_trials),
-
-                    # real peri-event time vector (no rounding)
-                    "time_s": np.tile(peri_times, n_trials),
-
-                    # signal value (already baseline-normalized / z-scored)
-                    "signal_z": peri_arr.reshape(-1)
-                })
-
-                # Attach mouse/session identifiers (CRITICAL for dual-mouse)
-                df_long["mouse"] = mouse_id
-                df_long["group"] = group_name
-                df_long["session"] = os.path.basename(s_path)
-                df_long["fs"] = fs
-                df_long["signalChannelSet"] = scs
-
-                df_long.to_csv(session_traces_long_csv, index=False)
-
-                summary["output_files"].setdefault(
-                    "peri_event_long_csvs", []
-                ).append(session_traces_long_csv)
-
-                # collect for optional master export
-                all_trace_dfs.append(df_long)
-
-                if verbose:
-                    print(f"Saved peri-event LONG traces -> {session_traces_long_csv}", flush=True)
-
 
                 fig, ax = plt.subplots(figsize=(6,4))
                 ax.plot(peri_times, session_mean)
                 ax.fill_between(peri_times, session_mean - session_sem, session_mean + session_sem, alpha=0.3)
                 ax.axvline(0, color="red", linestyle="--")
-                ax.set_title(f"{group_name} | {mouse_id} | {os.path.basename(s_path)}")
+                ax.set_title(f"{group_name} | {mouse_id} | {os.path.basename(s_path)}\nChannels: {sig_sub}/{ctrl_sub}")
                 ax.set_xlabel("Time (s)")
                 ax.set_ylabel("ΔF/F (z-scored baseline)")
                 fig.tight_layout()
                 fig.savefig(session_plot_path)
                 plt.close(fig)
                 if verbose:
-                    print(f"Saved session plot -> {session_plot_path}", flush=True)
+                    print(f"Saved: {session_plot_path}")
 
-                # Save Prism session table
-                try:
-                    save_prism_xy(peri_times, session_mean, session_sem, session_prism_csv)
-                    if verbose:
-                        print(f"Saved Prism session CSV -> {session_prism_csv}", flush=True)
-                    summary["output_files"].setdefault("prism_session_csvs", []).append(session_prism_csv)
-                except Exception as e:
-                    print(f"WARNING: failed to save Prism session CSV: {e}", flush=True)
-
+                # Save metrics
                 session_df = pd.DataFrame(session_metric_rows)
                 session_df.to_csv(session_metrics_path, index=False)
                 if verbose:
-                    print(f"Saved session metrics -> {session_metrics_path}", flush=True)
+                    print(f"Saved: {session_metrics_path}")
 
-                # append to global per-mouse pool
+                # Pool trials
                 for tr in peri_traces:
                     per_mouse_pooled_trials[mouse_id].append(tr)
-
-                # append to per-group per-mouse pool (so group means use only sessions assigned to this group)
-                for tr in peri_traces:
                     per_mouse_pooled_trials_by_group[group_name][mouse_id].append(tr)
 
                 per_mouse_session_counts[mouse_id] += 1
@@ -466,52 +392,7 @@ def run_batch_processing(
 
                 processed_sessions.add(s_path)
 
-    # -------------------
-    # per-mouse aggregation (global combined across all sessions)
-    mice_count = len(per_mouse_pooled_trials)
-    summary["n_mice"] = len(mice_seen)
-    if verbose:
-        print(f"\n--- Per-mouse pooling for {mice_count} mice ---", flush=True)
-
-    # DEBUG dump before building group means
-    def arr_hash(a):
-        try:
-            b = np.round(a, 6).tobytes()
-        except Exception:
-            a = np.asarray(a)
-            b = np.round(a, 6).tobytes()
-        return hashlib.md5(b).hexdigest()
-
-    print("\n--- DEBUG DUMP START ---", flush=True)
-    print("groups_dict (raw):", repr(groups_dict), flush=True)
-    print("mice_seen:", repr(mice_seen), flush=True)
-
-    print("\nper_mouse_pooled_trials keys and info:", flush=True)
-    for m, trials in per_mouse_pooled_trials.items():
-        try:
-            trials_arr = np.vstack(trials)
-            mean_trace = np.mean(trials_arr, axis=0)
-            print(f"  MOUSE: {m} | n_trials={len(trials)} | mean_shape={mean_trace.shape} | hash={arr_hash(mean_trace)} | first5={np.around(mean_trace[:5],4).tolist()}", flush=True)
-        except Exception as e:
-            print(f"  MOUSE: {m} | ERROR building mean: {e}", flush=True)
-
-    print("\nper_group_mouse_means_by_group (pre-build) summary:", flush=True)
-    for gname, mice_map in per_mouse_pooled_trials_by_group.items():
-        counts = {m: len(trs) for m, trs in mice_map.items()}
-        print(f"  GROUP: {gname} -> {counts}", flush=True)
-
-    try:
-        for root, dirs, files in os.walk(event_folder):
-            if root == event_folder:
-                print("\nTop-level event_folder contents:", "dirs:", dirs, "files:", files, flush=True)
-                break
-    except Exception as e:
-        print("Could not list event_folder:", e, flush=True)
-
-    print("--- DEBUG DUMP END ---\n", flush=True)
-
-    # -------------------
-    # Build per-group mouse means from per_mouse_pooled_trials_by_group
+    # Build group-level averages
     per_group_mouse_means = defaultdict(list)
     per_group_mouse_metrics_rows = defaultdict(list)
 
@@ -530,7 +411,6 @@ def run_batch_processing(
                 "sem": mouse_sem
             })
 
-            # compute per-mouse summary metrics for this group
             mrows = per_mouse_summary_metrics_by_group.get(gname, {}).get(mouse_id, [])
             if len(mrows) > 0:
                 mdf = pd.DataFrame(mrows)
@@ -551,48 +431,33 @@ def run_batch_processing(
                 "n_trials": n_trials
             })
 
-    # -------------------
-    # Ensure single comparison folder exists
+    # Create comparison folder
     comparison_root = os.path.join(event_folder, "comparison")
     os.makedirs(comparison_root, exist_ok=True)
     summary["output_files"]["comparison_root"] = comparison_root
 
-    # -------------------
-    # group-level aggregates and plots
-    if verbose:
-        print("\n--- Group-level aggregation ---", flush=True)
-
+    # Group plots
+    group_means_for_comparison = {}
     group_color_cycle = itertools.cycle([
         "red", "green", "purple", "orange", "brown", "pink", "gray"
     ])
 
-    group_means_for_comparison = {}
-    # For Prism multi-group table construction
-    group_mean_dict = {}
-    group_sem_dict = {}
-
     for gname, mouse_infos in per_group_mouse_means.items():
         gfolder = os.path.join(groups_root, _safe_name(gname))
         os.makedirs(gfolder, exist_ok=True)
-        group_mean_plot = os.path.join(gfolder, f"{_safe_name(gname)}_mean_trace.png")
-        group_all_mice_plot = os.path.join(gfolder, f"{_safe_name(gname)}_all_mice_traces.png")
-        group_summary_csv = os.path.join(gfolder, f"{_safe_name(gname)}_summary_metrics.csv")
-        group_prism_csv = os.path.join(prism_groups, f"{_safe_name(gname)}_group_mean_prism.csv")
-
+        
         if len(mouse_infos) == 0:
-            print(f"WARNING: no mouse means for group {gname}", flush=True)
-            summary["errors"].append({"group": gname, "error": "no_mouse_means"})
+            print(f"WARNING: no mouse means for group {gname}")
             continue
 
         arr = np.vstack([mi["mean"] for mi in mouse_infos])
         g_mean = np.mean(arr, axis=0)
         g_sem = arr.std(axis=0) / math.sqrt(arr.shape[0])
         group_means_for_comparison[gname] = (g_mean, g_sem)
-        group_mean_dict[gname] = g_mean
-        group_sem_dict[gname] = g_sem
 
         group_color = next(group_color_cycle)
 
+        # Group mean plot
         fig, ax = plt.subplots(figsize=(6,4))
         ax.plot(peri_times, g_mean, label=f"{gname} mean", color=group_color)
         ax.fill_between(peri_times, g_mean - g_sem, g_mean + g_sem, alpha=0.25, color=group_color)
@@ -606,47 +471,32 @@ def run_batch_processing(
         ax.set_ylabel("ΔF/F (z-scored baseline)")
         ax.legend(loc="best", fontsize="small")
         fig.tight_layout()
+        group_mean_plot = os.path.join(gfolder, f"{_safe_name(gname)}_mean_trace.png")
         fig.savefig(group_mean_plot)
         plt.close(fig)
         if verbose:
-            print(f"Saved group mean plot -> {group_mean_plot}", flush=True)
+            print(f"Saved: {group_mean_plot}")
 
-        # Save Prism group table (time, mean, sem)
-        try:
-            save_prism_xy(peri_times, g_mean, g_sem, group_prism_csv)
-            if verbose:
-                print(f"Saved Prism group CSV -> {group_prism_csv}", flush=True)
-            summary["output_files"].setdefault("prism_group_csvs", []).append(group_prism_csv)
-        except Exception as e:
-            print(f"WARNING: failed to save Prism group CSV: {e}", flush=True)
-
+        # All mice overlay
         fig, ax = plt.subplots(figsize=(8,5))
         for mi in mouse_infos:
             ax.plot(peri_times, mi["mean"], label=mi["mouse"], alpha=0.8)
-            ax.fill_between(peri_times, mi["mean"] - mi["sem"], mi["mean"] + mi["sem"], alpha=0.15)
-
         ax.axvline(0, color="black", linestyle="--")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("ΔF/F (z-scored baseline)")
-        ax.set_title(f"All mice traces: {gname}")
+        ax.set_title(f"All mice: {gname}")
         ax.legend(loc="best", fontsize="small")
         fig.tight_layout()
+        group_all_mice_plot = os.path.join(gfolder, f"{_safe_name(gname)}_all_mice_traces.png")
         fig.savefig(group_all_mice_plot)
         plt.close(fig)
-        if verbose:
-            print(f"Saved group all-mice overlay -> {group_all_mice_plot}", flush=True)
 
+        # Save metrics
         gm_df = pd.DataFrame(per_group_mouse_metrics_rows.get(gname, []))
+        group_summary_csv = os.path.join(gfolder, f"{_safe_name(gname)}_summary_metrics.csv")
         gm_df.to_csv(group_summary_csv, index=False)
-        if verbose:
-            print(f"Saved group summary metrics -> {group_summary_csv}", flush=True)
 
-        summary["output_files"].setdefault("group_plots", []).append(group_mean_plot)
-        summary["output_files"].setdefault("group_overlays", []).append(group_all_mice_plot)
-        summary["output_files"].setdefault("group_csvs", []).append(group_summary_csv)
-
-    # -------------------
-    # final group comparison across groups: overlay all group means with SEM shading
+    # Group comparison plot
     combined_fig_path = os.path.join(comparison_root, f"{_safe_name(selected_event)}_group_comparison.png")
     fig, ax = plt.subplots(figsize=(10,6))
 
@@ -669,79 +519,35 @@ def run_batch_processing(
     plt.close(fig)
     summary["output_files"]["group_comparison_plot"] = combined_fig_path
     if verbose:
-        print(f"Saved group comparison plot -> {combined_fig_path}", flush=True)
+        print(f"Saved: {combined_fig_path}")
 
-    # Save Prism multi-group comparison CSV
-    try:
-        comparison_prism_csv = os.path.join(prism_comparison, f"{_safe_name(selected_event)}_group_comparison_prism.csv")
-        save_prism_multigroup(peri_times, group_mean_dict, group_sem_dict, comparison_prism_csv)
-        summary["output_files"]["prism_comparison_csv"] = comparison_prism_csv
-        if verbose:
-            print(f"Saved Prism comparison CSV -> {comparison_prism_csv}", flush=True)
-    except Exception as e:
-        print(f"WARNING: failed to save Prism comparison CSV: {e}", flush=True)
-
-    # -------------------
+    # Save all trial metrics
     if len(all_trial_rows) > 0:
         all_trials_df = pd.DataFrame(all_trial_rows)
         all_trials_csv = os.path.join(event_folder, "all_groups_trial_metrics.csv")
         all_trials_df.to_csv(all_trials_csv, index=False)
         summary["output_files"]["all_groups_trial_metrics_csv"] = all_trials_csv
-        if verbose:
-            print(f"Saved master trial CSV -> {all_trials_csv}", flush=True)
-    else:
-        if verbose:
-            print("No trial rows collected; master trial CSV not created.", flush=True)
-
-    if len(all_trace_dfs) > 0:
-        all_traces_df = pd.concat(all_trace_dfs, ignore_index=True)
-        all_traces_csv = os.path.join(
-            event_folder, "all_groups_peri_event_traces_LONG.csv"
-        )
-        all_traces_df.to_csv(all_traces_csv, index=False)
-        summary["output_files"]["all_groups_peri_event_traces_LONG_csv"] = all_traces_csv
-        if verbose:
-            print(f"Saved MASTER peri-event LONG traces -> {all_traces_csv}", flush=True)
-
-
-    # Also save per-mouse Prism tables (global combined)
-    for mouse_id, trials in per_mouse_pooled_trials.items():
-        try:
-            if not trials:
-                continue
-            trials_arr = np.vstack(trials)
-            mouse_mean = np.mean(trials_arr, axis=0)
-            mouse_sem = trials_arr.std(axis=0) / math.sqrt(trials_arr.shape[0])
-            mouse_prism_csv = os.path.join(prism_mice, f"{_safe_name(mouse_id)}_combined_prism.csv")
-            save_prism_xy(peri_times, mouse_mean, mouse_sem, mouse_prism_csv)
-            summary["output_files"].setdefault("prism_mouse_csvs", []).append(mouse_prism_csv)
-            if verbose:
-                print(f"Saved Prism mouse CSV -> {mouse_prism_csv}", flush=True)
-        except Exception as e:
-            print(f"WARNING: failed to save Prism mouse CSV for {mouse_id}: {e}", flush=True)
 
     summary["n_mice"] = len(mice_seen)
-    summary["n_sessions"] = summary["n_sessions"]
-    summary["n_trials_total"] = summary["n_trials_total"]
-    summary["valid_trials"] = summary["valid_trials"]
-    summary["invalid_trials"] = summary["invalid_trials"]
-
     summary["output_files"].update({
         "event_folder": event_folder,
         "mice_root": mice_root,
         "groups_root": groups_root,
-        "prism_root": prism_root,
-        "prism_sessions": prism_sessions,
-        "prism_mice": prism_mice,
-        "prism_groups": prism_groups,
-        "prism_comparison": prism_comparison
+        "comparison_root": comparison_root
     })
 
     summary_path = os.path.join(event_folder, "summary_log.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     summary["output_files"]["summary_log"] = summary_path
+    
     if verbose:
-        print(f"Saved summary_log.json -> {summary_path}", flush=True)
+        print(f"\n{'='*60}")
+        print(f"PROCESSING COMPLETE")
+        print(f"Total mice: {len(mice_seen)}")
+        print(f"Total sessions: {summary['n_sessions']}")
+        print(f"Valid trials: {summary['valid_trials']}")
+        print(f"Output: {event_folder}")
+        print('='*60)
 
     return summary

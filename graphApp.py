@@ -15,6 +15,8 @@ from OHRBETsEventExtractor import parse_ohrbets_serial_log
 from nxtEventExtrator import readfile, get_events, get_event_codes
 from sessionInfoExtractor import *
 from batchProcessing import run_batch_processing
+from advanced_graphing import run_advanced_graphing
+
 matplotlib.use("Agg")
 
 color_cycle = itertools.cycle([
@@ -37,7 +39,13 @@ def find_stream_by_substr(block, substr):
 
 # Set up Streamlit
 st.set_page_config(layout="wide")
-tab1, tab2, tab3, tab4 = st.tabs(["📦 Data Extractor", "📈 Graph Viewer", "🧪 Peri Event Plots","Average Sessions"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Data Extractor",
+    "Graph Viewer", 
+    "Peri Event Plots",
+    "Average Sessions",
+    "Advanced Graphing"
+])
 
 if "code_map" not in st.session_state:
     st.session_state.code_map = code_map = {}
@@ -726,3 +734,163 @@ with tab4:
                 st.error(f"Processing failed: {e}")
                 import traceback
                 st.text(traceback.format_exc())
+
+with tab5:
+    st.title("Advanced Graphing")
+    st.markdown("Post-hoc visualization layer for batch-processed data")
+    
+    st.header("1. Select Events Folder")
+    
+    base_path = st.text_input(
+        "Enter path to parent directory:",
+        value="D:\\Fiberphotometry",
+        key="adv_path"
+    )
+    
+    if not os.path.exists(base_path):
+        st.warning(f"Path does not exist: {base_path}")
+    else:
+        plots_folder = os.path.join(base_path, "plots")
+        
+        if not os.path.exists(plots_folder):
+            st.info("Plots folder not found. Run batch processing first.")
+        else:
+            event_folders = sorted([
+                f for f in os.listdir(plots_folder)
+                if os.path.isdir(os.path.join(plots_folder, f))
+            ])
+            
+            if not event_folders:
+                st.info("No batch output folders found.")
+            else:
+                st.success(f"Found {len(event_folders)} event folder(s)")
+                
+                selected_event_folder = st.selectbox(
+                    "Select batch processing output:",
+                    event_folders
+                )
+                
+                events_folder_path = os.path.join(plots_folder, selected_event_folder)
+                
+                st.header("2. Select Sessions")
+                
+                prism_sessions_folder = os.path.join(events_folder_path, "prism_tables", "sessions")
+                
+                if os.path.exists(prism_sessions_folder):
+                    session_files = sorted([
+                        f for f in os.listdir(prism_sessions_folder)
+                        if f.endswith('_prism.csv')
+                    ])
+                    
+                    if session_files:
+                        st.write(f"Found {len(session_files)} sessions")
+                        
+                        selected_sessions = st.multiselect(
+                            "Select sessions:",
+                            session_files
+                        )
+                        
+                        if selected_sessions:
+                            st.success(f"{len(selected_sessions)} selected")
+                            
+                            st.header("3. Parameters")
+                            
+                            signal_type = st.radio(
+                                "Signal type:",
+                                ["z-score", "raw delta F/F"]
+                            )
+                            
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                baseline_start = st.number_input("Baseline start:", value=-4.0)
+                                baseline_end = st.number_input("Baseline end:", value=-1.0)
+                            
+                            with col2:
+                                response_start = st.number_input("Response start:", value=0.0)
+                                response_end = st.number_input("Response end:", value=5.0)
+                            
+                            window_valid = True
+                            if baseline_end <= baseline_start:
+                                st.error("Baseline end must be > start")
+                                window_valid = False
+                            if response_end <= response_start:
+                                st.error("Response end must be > start")
+                                window_valid = False
+                            
+                            st.header("4. Plot Types")
+                            
+                            plot_types = []
+                            
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                if st.checkbox("Signal Mean"):
+                                    plot_types.append('signal_mean')
+                            
+                            with col2:
+                                if st.checkbox("AUC"):
+                                    plot_types.append('auc')
+                            
+                            with col3:
+                                if st.checkbox("Heatmap"):
+                                    plot_types.append('heatmap')
+                            
+                            if plot_types and window_valid:
+                                st.header("5. Generate")
+                                
+                                if st.button("Generate Plots", type="primary"):
+                                    # Get trial counts
+                                    trial_counts = {}
+                                    mice_folder = os.path.join(events_folder_path, "mice")
+                                    
+                                    for sf in selected_sessions:
+                                        sname = sf.replace('_prism.csv', '')
+                                        trial_counts[sf] = 10
+                                        
+                                        if os.path.exists(mice_folder):
+                                            for root, dirs, files in os.walk(mice_folder):
+                                                for f in files:
+                                                    if sname in f and '_metrics.csv' in f:
+                                                        try:
+                                                            mdf = pd.read_csv(os.path.join(root, f))
+                                                            trial_counts[sf] = len(mdf)
+                                                        except:
+                                                            pass
+                                    
+                                    with st.spinner("Processing..."):
+                                        try:
+                                            summary = run_advanced_graphing(
+                                                events_folder=events_folder_path,
+                                                selected_sessions=selected_sessions,
+                                                signal_type=signal_type,
+                                                baseline_window=(baseline_start, baseline_end),
+                                                response_window=(response_start, response_end),
+                                                plot_types=plot_types,
+                                                trial_counts=trial_counts
+                                            )
+                                            
+                                            st.success(f"Done! Processed: {summary['n_sessions_processed']}")
+                                            st.info(f"Output: {summary['output_folder']}")
+                                            
+                                            if summary['n_errors'] > 0:
+                                                st.warning(f"Errors: {summary['n_errors']}")
+                                                for err in summary['errors']:
+                                                    st.text(f"{err['session']}: {err['error']}")
+                                            
+                                            agg_csv = os.path.join(summary['output_folder'], "aggregated_session_stats.csv")
+                                            if os.path.exists(agg_csv):
+                                                st.subheader("Aggregated Stats")
+                                                st.dataframe(pd.read_csv(agg_csv))
+                                        
+                                        except Exception as e:
+                                            st.error(f"Error: {e}")
+                                            import traceback
+                                            st.text(traceback.format_exc())
+                            else:
+                                if not plot_types:
+                                    st.info("Select at least one plot type")
+                    else:
+                        st.warning("No session files found")
+                else:
+                    st.error("Prism sessions folder not found")

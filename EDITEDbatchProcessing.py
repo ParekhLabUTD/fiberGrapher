@@ -83,22 +83,12 @@ def run_batch_processing(
         os.makedirs(p, exist_ok=True)
 
     def norm(p): return os.path.normpath(p)
-    # This is CRITICAL for dual-mouse sessions
-    meta_lookup = {}
-    for m in (metadata_list or []):
-        key = (norm(m['path']), m.get('mouseID'))
-        meta_lookup[key] = m
-    
-    if verbose:
-        print(f"\n=== METADATA LOOKUP DEBUG ===")
-        print(f"Total metadata entries: {len(metadata_list)}")
-        print(f"Unique (path, mouseID) combinations: {len(meta_lookup)}")
-        for key, meta in list(meta_lookup.items())[:5]:  # Show first 5
-            print(f"  {key[1]} @ {os.path.basename(key[0])} -> signalChannelSet={meta.get('signalChannelSet')}")
-        print("=" * 50 + "\n")
+    meta_lookup = { norm(m['path']): m for m in (metadata_list or []) }
 
     all_trial_rows = []
-    all_trace_dfs = []  
+
+    # NEW: collect full peri-event traces (LONG) across everything (optional master export)
+    all_trace_dfs = []   # list of per-session LONG dataframes
 
     summary = {
         "run_timestamp": timestamp_str,
@@ -141,33 +131,13 @@ def run_batch_processing(
                     print(f"Session path: {s_path}", flush=True)
 
                 norm_path = norm(s_path)
-                
-                # *** FIX: Use mouse-specific metadata lookup ***
-                meta_key = (norm_path, mouse_id)
-                meta = meta_lookup.get(meta_key)
-                
+                meta = meta_lookup.get(norm_path)
                 if meta is None:
-                    err = f"metadata_missing for mouse {mouse_id} in {s_path}"
-                    print(f"ERROR: {err}")
-                    print(f"  Available keys for this path:")
-                    for k in meta_lookup.keys():
-                        if k[0] == norm_path:
-                            print(f"    - Mouse: {k[1]}")
-                    summary["errors"].append({"session": s_path, "mouse": mouse_id, "error": err})
+                    err = f"metadata_missing for {s_path}"
+                    print("WARNING:", err, flush=True)
+                    summary["errors"].append({"session": s_path, "error": err})
                     continue
 
-                # *** FIX: Get the CORRECT signalChannelSet for THIS mouse ***
-                scs = int(meta.get("signalChannelSet", 1))
-                if verbose:
-                    print(f"Mouse {mouse_id} -> signalChannelSet = {scs}")
-                
-                if scs == 1:
-                    sig_sub, ctrl_sub = "_465A", "_415A"
-                else:
-                    sig_sub, ctrl_sub = "_465C", "_415C"
-                
-                if verbose:
-                    print(f"Using channels: Signal={sig_sub}, Control={ctrl_sub}")
                 try:
                     block = load_tdt_block(s_path)
                 except Exception as e:
@@ -183,6 +153,12 @@ def run_batch_processing(
                 if verbose:
                     print(f"Loaded block: {s_path}", flush=True)
                     print("Available stream keys:", avail_streams, flush=True)
+
+                scs = int(meta.get("signalChannelSet", 1))
+                if scs == 1:
+                    sig_sub, ctrl_sub = "_465A", "_415A"
+                else:
+                    sig_sub, ctrl_sub = "_465C", "_415C"
 
                 sig_key = find_stream_by_substr(block, sig_sub)
                 ctrl_key = find_stream_by_substr(block, ctrl_sub)
@@ -293,6 +269,9 @@ def run_batch_processing(
                 session_metric_rows = []
                 trial_index = 0
 
+                # NEW: store absolute event time (ts) for each VALID trial (optional)
+                valid_trial_event_times = []
+
                 for ts in event_times:
                     start_idx = int(round((ts - pre_t) * fs))
                     end_idx = start_idx + n_samples
@@ -352,6 +331,7 @@ def run_batch_processing(
                         peak, auc, latency = np.nan, np.nan, np.nan
 
                     peri_traces.append(snippet_z)
+                    valid_trial_event_times.append(ts)
                     session_metric_rows.append({
                         "group": group_name,
                         "mouse": mouse_id,
@@ -362,8 +342,7 @@ def run_batch_processing(
                         "latency": latency,
                         "n_timepoints": len(snippet_z),
                         "zscored": bool(zscored_flag),
-                        "fs": fs,
-                        "signalChannelSet": scs
+                        "fs": fs
                     })
 
                     all_trial_rows.append(session_metric_rows[-1])
@@ -378,52 +357,44 @@ def run_batch_processing(
                 peri_arr = np.vstack(peri_traces)
                 session_mean = np.mean(peri_arr, axis=0)
                 session_sem = peri_arr.std(axis=0) / math.sqrt(peri_arr.shape[0])
+
+                # -------------------
+                # NEW: Export peri-event trial traces (LONG CSV)
+                # -------------------
                 session_traces_long_csv = os.path.join(
                     mouse_folder, f"{session_basename}_peri_event_traces_LONG.csv"
                 )
 
                 n_trials, n_tp = peri_arr.shape
-                global_time_s = []
-
-                for ts in event_times[:n_trials]:
-                    peri_global = ts + peri_times
-                    global_time_s.extend(peri_global)
-
 
                 df_long = pd.DataFrame({
-                    # trial index (1-based, consistent with metrics)
+              
                     "trial_index": np.repeat(np.arange(1, n_trials + 1), n_tp),
-                    "global_time_s": global_time_s,
 
-                    # stable integer index for reshaping/pivoting later
+                    # NEW: stable integer index for reshaping/pivoting later
                     "time_idx": np.tile(np.arange(n_tp), n_trials),
 
-                    # real peri-event time vector (no rounding)
+                    # REAL peri-event times (no rounding)
                     "time_s": np.tile(peri_times, n_trials),
 
-                    # signal value (already baseline-normalized / z-scored)
                     "signal_z": peri_arr.reshape(-1)
                 })
 
-                # Attach mouse/session identifiers (CRITICAL for dual-mouse)
-                df_long["mouse"] = mouse_id
-                df_long["group"] = group_name
-                df_long["session"] = os.path.basename(s_path)
-                df_long["fs"] = fs
-                df_long["signalChannelSet"] = scs
+                # Optional: attach per-trial metrics (repeated across timepoints)
+                metrics_cols = ["trial_index", "n_timepoints"]
+                metrics_df = pd.DataFrame(session_metric_rows)[metrics_cols]
+                df_long = df_long.merge(metrics_df, on="trial_index", how="left")
 
                 df_long.to_csv(session_traces_long_csv, index=False)
 
-                summary["output_files"].setdefault(
-                    "peri_event_long_csvs", []
-                ).append(session_traces_long_csv)
+                # Track outputs
+                summary["output_files"].setdefault("peri_event_long_csvs", []).append(session_traces_long_csv)
 
-                # collect for optional master export
+                # Optional: collect for one master file later
                 all_trace_dfs.append(df_long)
 
                 if verbose:
                     print(f"Saved peri-event LONG traces -> {session_traces_long_csv}", flush=True)
-
 
                 fig, ax = plt.subplots(figsize=(6,4))
                 ax.plot(peri_times, session_mean)
@@ -623,8 +594,6 @@ def run_batch_processing(
         fig, ax = plt.subplots(figsize=(8,5))
         for mi in mouse_infos:
             ax.plot(peri_times, mi["mean"], label=mi["mouse"], alpha=0.8)
-            ax.fill_between(peri_times, mi["mean"] - mi["sem"], mi["mean"] + mi["sem"], alpha=0.15)
-
         ax.axvline(0, color="black", linestyle="--")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("ΔF/F (z-scored baseline)")
@@ -693,16 +662,16 @@ def run_batch_processing(
         if verbose:
             print("No trial rows collected; master trial CSV not created.", flush=True)
 
+    # -------------------
+    # NEW: Master peri-event LONG CSV across all groups/sessions (optional)
+    # -------------------
     if len(all_trace_dfs) > 0:
         all_traces_df = pd.concat(all_trace_dfs, ignore_index=True)
-        all_traces_csv = os.path.join(
-            event_folder, "all_groups_peri_event_traces_LONG.csv"
-        )
+        all_traces_csv = os.path.join(event_folder, "all_groups_peri_event_traces_LONG.csv")
         all_traces_df.to_csv(all_traces_csv, index=False)
         summary["output_files"]["all_groups_peri_event_traces_LONG_csv"] = all_traces_csv
         if verbose:
             print(f"Saved MASTER peri-event LONG traces -> {all_traces_csv}", flush=True)
-
 
     # Also save per-mouse Prism tables (global combined)
     for mouse_id, trials in per_mouse_pooled_trials.items():
@@ -745,3 +714,4 @@ def run_batch_processing(
         print(f"Saved summary_log.json -> {summary_path}", flush=True)
 
     return summary
+
