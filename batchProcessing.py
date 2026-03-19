@@ -344,9 +344,20 @@ def run_batch_processing(
 
                     if mend_idx > mstart_idx:
                         post_segment = snippet_z[mstart_idx:mend_idx]
-                        peak = float(np.max(post_segment))
                         auc = float(np.trapz(post_segment, dx=1.0/fs))
-                        latency_idx = int(np.argmax(post_segment))
+
+                        # Detect excitatory vs inhibitory response:
+                        # use whichever extreme has the larger absolute value
+                        seg_max = float(np.max(post_segment))
+                        seg_min = float(np.min(post_segment))
+                        if abs(seg_min) > abs(seg_max):
+                            # Inhibitory: nadir is the dominant peak
+                            peak = seg_min
+                            latency_idx = int(np.argmin(post_segment))
+                        else:
+                            # Excitatory (or flat): max is the dominant peak
+                            peak = seg_max
+                            latency_idx = int(np.argmax(post_segment))
                         latency = float(latency_idx / fs + metric_start)
                     else:
                         peak, auc, latency = np.nan, np.nan, np.nan

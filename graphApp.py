@@ -15,7 +15,12 @@ from OHRBETsEventExtractor import parse_ohrbets_serial_log
 from nxtEventExtrator import readfile, get_events, get_event_codes
 from sessionInfoExtractor import *
 from batchProcessing import run_batch_processing
-from advanced_graphing import run_advanced_graphing
+from advanced_graphing import (
+    run_advanced_graphing, discover_sessions,
+    discover_sessions_recursive, run_advanced_graphing_from_discovered,
+    discover_event_folders, discover_prism_sessions,
+    discover_long_trace_sessions,
+)
 
 matplotlib.use("Agg")
 
@@ -660,237 +665,391 @@ with tab4:
     
     if "groups" not in st.session_state:
         st.session_state["groups"] = {}
-        st.info("Create groups and assign sessions in the UI above before processing.")
-        st.stop()
 
     if not st.session_state["groups"]:
         st.info("No groups defined. Create groups and assign sessions first.")
-        st.stop()
+    else:
+        # Build event name choices from sessions currently assigned in groups
+        selected_session_paths = []
+        for g, mice in st.session_state["groups"].items():
+            for m, paths in mice.items():
+                selected_session_paths.extend(paths)
+        # gather event names from metadata for only those sessions
+        event_names = set()
+        if "metadata" in st.session_state:
+            meta_lookup = {m['path']: m for m in st.session_state["metadata"]}
+            for sp in selected_session_paths:
+                meta = meta_lookup.get(sp)
+                if not meta:
+                    continue
+                for e in meta.get("events", []):
+                    event_names.add(e.get("event"))
+        event_names = sorted([en for en in event_names if en is not None])
+        if not event_names:
+            st.error("No events found in selected sessions' metadata.")
+        else:
+            st.markdown("### Event & Processing Options")
+            selected_event = st.selectbox("Select event (one):", event_names)
+            pre_t = st.number_input("Peri-event PRE time (s)", min_value=0.0, value=5.0)
+            post_t = st.number_input("Peri-event POST time (s)", min_value=0.0, value=10.0)
+            baseline_lower = st.number_input("Baseline window start (s, relative to T0, negative)", value=-4.0)
+            baseline_upper = st.number_input("Baseline window end (s, relative to T0, negative or <0)", value=-1.0)
+            downsample_factor = st.number_input("Downsample factor (integer ≥1)", min_value=1, value=1, step=1)
+            metric_start = st.number_input("Metric window start (s, relative to T0)", value=0.0)
+            metric_end = st.number_input("Metric window end (s, relative to T0)", value=5.0)
 
-    # Build event name choices from sessions currently assigned in groups
-    selected_session_paths = []
-    for g, mice in st.session_state["groups"].items():
-        for m, paths in mice.items():
-            selected_session_paths.extend(paths)
-    # gather event names from metadata for only those sessions
-    event_names = set()
-    meta_lookup = {m['path']: m for m in st.session_state["metadata"]}
-    for sp in selected_session_paths:
-        meta = meta_lookup.get(sp)
-        if not meta:
-            continue
-        for e in meta.get("events", []):
-            event_names.add(e.get("event"))
-    event_names = sorted([en for en in event_names if en is not None])
-    if not event_names:
-        st.error("No events found in selected sessions' metadata.")
-        st.stop()
+            if metric_end <= metric_start:
+                st.error("Metric end must be > metric start.")
+            else:
+                # Output folder base (timestamped to avoid overwrite)
+                timestamp_str = dt.now().strftime("%Y%m%d_%H%M%S")
+                plots_base = os.path.join(path, "plots", f"{_safe_name(selected_event)}_{timestamp_str}")
+                os.makedirs(plots_base, exist_ok=True)
 
-    st.markdown("### Event & Processing Options")
-    selected_event = st.selectbox("Select event (one):", event_names)
-    pre_t = st.number_input("Peri-event PRE time (s)", min_value=0.0, value=5.0)
-    post_t = st.number_input("Peri-event POST time (s)", min_value=0.0, value=10.0)
-    baseline_lower = st.number_input("Baseline window start (s, relative to T0, negative)", value=-4.0)
-    baseline_upper = st.number_input("Baseline window end (s, relative to T0, negative or <0)", value=-1.0)
-    downsample_factor = st.number_input("Downsample factor (integer ≥1)", min_value=1, value=1, step=1)
-    metric_start = st.number_input("Metric window start (s, relative to T0)", value=0.0)
-    metric_end = st.number_input("Metric window end (s, relative to T0)", value=5.0)
+                # Prepare containers for results
+                per_mouse_session_traces = defaultdict(list)   # mouse -> list of session avg traces (arrays)
+                per_mouse_session_info = defaultdict(list)     # mouse -> list of (group, session_name)
+                per_group_mouse_traces = defaultdict(lambda: defaultdict(list))  # group -> mouse -> mean trace
+                all_metrics = []  # rows for CSV
 
-    if metric_end <= metric_start:
-        st.error("Metric end must be > metric start.")
-        st.stop()
-
-    # Output folder base (timestamped to avoid overwrite)
-    timestamp_str = dt.now().strftime("%Y%m%d_%H%M%S")
-    plots_base = os.path.join(path, "plots", f"{_safe_name(selected_event)}_{timestamp_str}")
-    os.makedirs(plots_base, exist_ok=True)
-
-    # Prepare containers for results
-    per_mouse_session_traces = defaultdict(list)   # mouse -> list of session avg traces (arrays)
-    per_mouse_session_info = defaultdict(list)     # mouse -> list of (group, session_name)
-    per_group_mouse_traces = defaultdict(lambda: defaultdict(list))  # group -> mouse -> mean trace
-    all_metrics = []  # rows for CSV
-
-    # Processing button
-    if st.button("▶️ Run Averaging & Save Plots"):
-        with st.spinner("Running batch processing..."):
-            try:
-                summary = run_batch_processing(
-                base_path=path,
-                selected_event=selected_event,
-                pre_t=pre_t, post_t=post_t,
-                baseline_lower=baseline_lower, baseline_upper=baseline_upper,
-                downsample_factor=downsample_factor,
-                metric_start=metric_start, metric_end=metric_end,
-                metadata_list=st.session_state.get("metadata", []),
-                groups_dict=st.session_state.get("groups", {}),
-                find_stream_by_substr=find_stream_by_substr,
-                load_tdt_block=load_tdt_block,
-                verbose=True
-            )
-                st.success(f"Processing complete. Output folder: {summary['output_files']['event_folder']}")
-                st.write(summary)  # visible run summary in the UI
-            except Exception as e:
-                st.error(f"Processing failed: {e}")
-                import traceback
-                st.text(traceback.format_exc())
+                # Processing button
+                if st.button("▶️ Run Averaging & Save Plots"):
+                    with st.spinner("Running batch processing..."):
+                        try:
+                            summary = run_batch_processing(
+                                base_path=path,
+                                selected_event=selected_event,
+                                pre_t=pre_t, post_t=post_t,
+                                baseline_lower=baseline_lower, baseline_upper=baseline_upper,
+                                downsample_factor=downsample_factor,
+                                metric_start=metric_start, metric_end=metric_end,
+                                metadata_list=st.session_state.get("metadata", []),
+                                groups_dict=st.session_state.get("groups", {}),
+                                find_stream_by_substr=find_stream_by_substr,
+                                load_tdt_block=load_tdt_block,
+                                verbose=True,
+                            )
+                            st.success(f"Processing complete. Output folder: {summary['output_files']['event_folder']}")
+                            st.write(summary)  # visible run summary in the UI
+                        except Exception as e:
+                            st.error(f"Processing failed: {e}")
+                            import traceback
+                            st.text(traceback.format_exc())
 
 with tab5:
-    st.title("Advanced Graphing")
-    st.markdown("Post-hoc visualization layer for batch-processed data")
-    
-    st.header("1. Select Events Folder")
-    
-    base_path = st.text_input(
+    st.title("📊 Advanced Graphing")
+    st.markdown("Post-hoc visualization of batch-processed data")
+
+    # ── 1. Select Data Folder ──────────────────────────────────────────────
+    st.header("1. Select Data Folder")
+
+    adv_base_path = st.text_input(
         "Enter path to parent directory:",
         value="D:\\Fiberphotometry",
-        key="adv_path"
+        key="adv_path",
     )
-    
-    if not os.path.exists(base_path):
-        st.warning(f"Path does not exist: {base_path}")
+
+    if not os.path.isdir(adv_base_path):
+        st.warning("⚠️ Please enter a valid folder path.")
     else:
-        plots_folder = os.path.join(base_path, "plots")
-        
-        if not os.path.exists(plots_folder):
-            st.info("Plots folder not found. Run batch processing first.")
+        adv_folders = sorted(
+            f for f in os.listdir(adv_base_path)
+            if os.path.isdir(os.path.join(adv_base_path, f))
+            and not f.startswith(".")
+        )
+
+        if not adv_folders:
+            st.info("No subfolders found in this directory.")
         else:
-            event_folders = sorted([
-                f for f in os.listdir(plots_folder)
-                if os.path.isdir(os.path.join(plots_folder, f))
-            ])
-            
-            if not event_folders:
-                st.info("No batch output folders found.")
-            else:
-                st.success(f"Found {len(event_folders)} event folder(s)")
-                
-                selected_event_folder = st.selectbox(
-                    "Select batch processing output:",
-                    event_folders
+            adv_selected_folder = st.selectbox(
+                "Available Folders:",
+                adv_folders,
+                key="adv_folder_select",
+            )
+            adv_full_path = os.path.join(adv_base_path, adv_selected_folder)
+
+            # ── 2. Select Event Folder ─────────────────────────────────────
+            st.header("2. Select Event Folder")
+
+            adv_event_folders = discover_event_folders(adv_full_path)
+
+            if not adv_event_folders:
+                st.info(
+                    "No `plots/` subfolder found. Run batch processing "
+                    "first (Tab 4) or select a different folder."
                 )
-                
-                events_folder_path = os.path.join(plots_folder, selected_event_folder)
-                
-                st.header("2. Select Sessions")
-                
-                prism_sessions_folder = os.path.join(events_folder_path, "prism_tables", "sessions")
-                
-                if os.path.exists(prism_sessions_folder):
-                    session_files = sorted([
-                        f for f in os.listdir(prism_sessions_folder)
-                        if f.endswith('_prism.csv')
-                    ])
-                    
-                    if session_files:
-                        st.write(f"Found {len(session_files)} sessions")
-                        
-                        selected_sessions = st.multiselect(
-                            "Select sessions:",
-                            session_files
-                        )
-                        
-                        if selected_sessions:
-                            st.success(f"{len(selected_sessions)} selected")
-                            
-                            st.header("3. Parameters")
-                            
-                            signal_type = st.radio(
-                                "Signal type:",
-                                ["z-score", "raw delta F/F"]
-                            )
-                            
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                baseline_start = st.number_input("Baseline start:", value=-4.0)
-                                baseline_end = st.number_input("Baseline end:", value=-1.0)
-                            
-                            with col2:
-                                response_start = st.number_input("Response start:", value=0.0)
-                                response_end = st.number_input("Response end:", value=5.0)
-                            
-                            window_valid = True
-                            if baseline_end <= baseline_start:
-                                st.error("Baseline end must be > start")
-                                window_valid = False
-                            if response_end <= response_start:
-                                st.error("Response end must be > start")
-                                window_valid = False
-                            
-                            st.header("4. Plot Types")
-                            
-                            plot_types = []
-                            
-                            col1, col2, col3 = st.columns(3)
-                            
-                            with col1:
-                                if st.checkbox("Signal Mean"):
-                                    plot_types.append('signal_mean')
-                            
-                            with col2:
-                                if st.checkbox("AUC"):
-                                    plot_types.append('auc')
-                            
-                            with col3:
-                                if st.checkbox("Heatmap"):
-                                    plot_types.append('heatmap')
-                            
-                            if plot_types and window_valid:
-                                st.header("5. Generate")
-                                
-                                if st.button("Generate Plots", type="primary"):
-                                    # Get trial counts
-                                    trial_counts = {}
-                                    mice_folder = os.path.join(events_folder_path, "mice")
-                                    
-                                    for sf in selected_sessions:
-                                        sname = sf.replace('_prism.csv', '')
-                                        trial_counts[sf] = 10
-                                        
-                                        if os.path.exists(mice_folder):
-                                            for root, dirs, files in os.walk(mice_folder):
-                                                for f in files:
-                                                    if sname in f and '_metrics.csv' in f:
-                                                        try:
-                                                            mdf = pd.read_csv(os.path.join(root, f))
-                                                            trial_counts[sf] = len(mdf)
-                                                        except:
-                                                            pass
-                                    
-                                    with st.spinner("Processing..."):
-                                        try:
-                                            summary = run_advanced_graphing(
-                                                events_folder=events_folder_path,
-                                                selected_sessions=selected_sessions,
-                                                signal_type=signal_type,
-                                                baseline_window=(baseline_start, baseline_end),
-                                                response_window=(response_start, response_end),
-                                                plot_types=plot_types,
-                                                trial_counts=trial_counts
-                                            )
-                                            
-                                            st.success(f"Done! Processed: {summary['n_sessions_processed']}")
-                                            st.info(f"Output: {summary['output_folder']}")
-                                            
-                                            if summary['n_errors'] > 0:
-                                                st.warning(f"Errors: {summary['n_errors']}")
-                                                for err in summary['errors']:
-                                                    st.text(f"{err['session']}: {err['error']}")
-                                            
-                                            agg_csv = os.path.join(summary['output_folder'], "aggregated_session_stats.csv")
-                                            if os.path.exists(agg_csv):
-                                                st.subheader("Aggregated Stats")
-                                                st.dataframe(pd.read_csv(agg_csv))
-                                        
-                                        except Exception as e:
-                                            st.error(f"Error: {e}")
-                                            import traceback
-                                            st.text(traceback.format_exc())
+            else:
+                st.success(f"Found {len(adv_event_folders)} event folder(s)")
+
+                adv_selected_event = st.selectbox(
+                    "Select batch processing output:",
+                    adv_event_folders,
+                    key="adv_event_folder",
+                )
+
+                adv_event_path = os.path.join(
+                    adv_full_path, "plots", adv_selected_event
+                )
+
+                # Debug: show what's inside the event folder
+                with st.expander("📁 Event folder contents (debug)"):
+                    st.caption(f"Path: `{adv_event_path}`")
+                    if os.path.isdir(adv_event_path):
+                        for item in sorted(os.listdir(adv_event_path)):
+                            full_item = os.path.join(adv_event_path, item)
+                            if os.path.isdir(full_item):
+                                st.text(f"📁 {item}/")
                             else:
-                                if not plot_types:
-                                    st.info("Select at least one plot type")
+                                st.text(f"   {item}")
                     else:
-                        st.warning("No session files found")
+                        st.error(f"Path does not exist!")
+
+                # ── 3. Choose Graph Type ───────────────────────────────────
+                st.header("3. Choose Graph Type")
+
+                adv_graph_type = st.radio(
+                    "What kind of graph do you want to make?",
+                    [
+                        "Signal Mean Bar Plot",
+                        "AUC Bar Plot",
+                        "Heatmap",
+                    ],
+                    key="adv_graph_type",
+                )
+
+                # Map display name → internal key
+                _graph_type_map = {
+                    "Signal Mean Bar Plot": "signal_mean",
+                    "AUC Bar Plot": "auc",
+                    "Heatmap": "heatmap",
+                }
+                adv_internal_type = _graph_type_map[adv_graph_type]
+
+                # Determine which CSVs to show based on graph type
+                needs_long = adv_internal_type == "heatmap"
+
+                if needs_long:
+                    st.info(
+                        "Heatmaps require **trial-level LONG CSVs** "
+                        "(from `mice/` folder)."
+                    )
+                    adv_csv_map = discover_long_trace_sessions(adv_event_path)
+                    csv_label = "LONG trace CSVs"
                 else:
-                    st.error("Prism sessions folder not found")
+                    st.info(
+                        f"{adv_graph_type}s use **session prism CSVs** "
+                        f"(from `prism_tables/sessions/`)."
+                    )
+                    adv_csv_map = discover_prism_sessions(adv_event_path)
+                    csv_label = "prism session CSVs"
+
+                # ── 4. Select Sessions ─────────────────────────────────────
+                st.header("4. Select Sessions")
+
+                if not adv_csv_map:
+                    st.warning(f"No {csv_label} found in this event folder.")
+                    # Show diagnostic info
+                    if needs_long:
+                        check_dir = os.path.join(adv_event_path, "mice")
+                    else:
+                        check_dir = os.path.join(
+                            adv_event_path, "prism_tables", "sessions"
+                        )
+                    st.caption(f"Looked in: `{check_dir}`")
+                    st.caption(
+                        f"Directory exists: {os.path.isdir(check_dir)}"
+                    )
+                else:
+                    csv_labels = sorted(adv_csv_map.keys())
+                    st.success(f"Found {len(csv_labels)} {csv_label}")
+
+                    adv_selected_csvs = st.multiselect(
+                        f"Select {csv_label} to process:",
+                        csv_labels,
+                        key="adv_csv_select",
+                    )
+
+                    if not adv_selected_csvs:
+                        st.info("Select one or more sessions to continue.")
+                    else:
+                        st.success(
+                            f"{len(adv_selected_csvs)} session(s) selected"
+                        )
+
+                        # ── 5. Parameters ──────────────────────────────────
+                        st.header("5. Parameters")
+
+                        adv_signal_type = st.radio(
+                            "Signal type:",
+                            ["z-score", "raw ΔF/F"],
+                            key="adv_signal_type",
+                        )
+
+                        col_bl, col_rsp = st.columns(2)
+
+                        with col_bl:
+                            st.markdown("**Baseline window (s)**")
+                            adv_bl_start = st.number_input(
+                                "Baseline start (s):",
+                                value=-4.0,
+                                key="adv_bl_start",
+                            )
+                            adv_bl_end = st.number_input(
+                                "Baseline end (s):",
+                                value=-1.0,
+                                key="adv_bl_end",
+                            )
+
+                        with col_rsp:
+                            st.markdown("**Response window (s)**")
+                            adv_rsp_start = st.number_input(
+                                "Response start (s):",
+                                value=0.0,
+                                key="adv_rsp_start",
+                            )
+                            adv_rsp_end = st.number_input(
+                                "Response end (s):",
+                                value=5.0,
+                                key="adv_rsp_end",
+                            )
+
+                        adv_window_valid = True
+                        if adv_bl_end <= adv_bl_start:
+                            st.error(
+                                "Baseline end must be > baseline start"
+                            )
+                            adv_window_valid = False
+                        if adv_rsp_end <= adv_rsp_start:
+                            st.error(
+                                "Response end must be > response start"
+                            )
+                            adv_window_valid = False
+
+                        # ── 6. Generate ────────────────────────────────────
+                        st.header("6. Generate")
+
+                        generate_disabled = not adv_window_valid
+
+                        if st.button(
+                            "🚀 Generate Plots",
+                            type="primary",
+                            disabled=generate_disabled,
+                            key="adv_generate",
+                        ):
+                            with st.spinner("Generating plots…"):
+                                try:
+                                    output_root = os.path.join(
+                                        adv_event_path,
+                                        "advanced_graphs",
+                                    )
+
+                                    if needs_long:
+                                        # Heatmap: process each LONG CSV
+                                        # Build discovered dict with
+                                        # matching prism CSVs
+                                        prism_map = discover_prism_sessions(
+                                            adv_event_path
+                                        )
+                                        discovered = {}
+                                        for label in adv_selected_csvs:
+                                            long_path = adv_csv_map[label]
+                                            # Find matching prism CSV by
+                                            # session key overlap
+                                            session_key = label.replace(
+                                                "_peri_event_traces_LONG.csv",
+                                                "",
+                                            )
+                                            match_prism = None
+                                            for pname, ppath in prism_map.items():
+                                                if session_key in pname:
+                                                    match_prism = ppath
+                                                    break
+                                            discovered[label] = {
+                                                "prism_path": match_prism,
+                                                "long_csv_path": long_path,
+                                            }
+                                    else:
+                                        # Bar plots: process each prism CSV
+                                        long_map = discover_long_trace_sessions(
+                                            adv_event_path
+                                        )
+                                        discovered = {}
+                                        for label in adv_selected_csvs:
+                                            prism_path = adv_csv_map[label]
+                                            prism_key = label.replace(
+                                                "_prism.csv", ""
+                                            )
+                                            match_long = None
+                                            # LONG name: {session}_LONG.csv
+                                            # prism key: {mouse}_{session}
+                                            # Check long_key in prism_key
+                                            for lname, lpath in long_map.items():
+                                                long_key = lname.replace(
+                                                    "_peri_event_traces_LONG.csv",
+                                                    "",
+                                                )
+                                                if long_key and long_key in prism_key:
+                                                    match_long = lpath
+                                                    break
+                                            discovered[label] = {
+                                                "prism_path": prism_path,
+                                                "long_csv_path": match_long,
+                                            }
+
+                                    adv_summary = run_advanced_graphing_from_discovered(
+                                        discovered_sessions=discovered,
+                                        selected_basenames=adv_selected_csvs,
+                                        output_folder=output_root,
+                                        signal_type=adv_signal_type,
+                                        baseline_window=(
+                                            adv_bl_start, adv_bl_end,
+                                        ),
+                                        response_window=(
+                                            adv_rsp_start, adv_rsp_end,
+                                        ),
+                                        plot_types=[adv_internal_type],
+                                    )
+
+                                    st.success(
+                                        f"✅ Done! Processed "
+                                        f"{adv_summary['n_sessions_processed']}"
+                                        f" session(s)."
+                                    )
+                                    st.info(
+                                        f"Output folder: "
+                                        f"{adv_summary['output_folder']}"
+                                    )
+
+                                    for sr in adv_summary.get(
+                                        "session_results", []
+                                    ):
+                                        for w in sr.get("warnings", []):
+                                            st.warning(w)
+
+                                    if adv_summary["n_errors"] > 0:
+                                        st.error(
+                                            f"{adv_summary['n_errors']}"
+                                            f" session(s) had errors:"
+                                        )
+                                        for err in adv_summary["errors"]:
+                                            st.text(
+                                                f"  {err['session']}:"
+                                                f" {err['error']}"
+                                            )
+
+                                    agg_csv = adv_summary.get(
+                                        "aggregated_csv"
+                                    )
+                                    if agg_csv and os.path.exists(agg_csv):
+                                        st.subheader(
+                                            "Aggregated Session Stats"
+                                        )
+                                        st.dataframe(
+                                            pd.read_csv(agg_csv),
+                                            use_container_width=True,
+                                        )
+
+                                except Exception as e:
+                                    st.error(f"❌ Error: {e}")
+                                    import traceback
+                                    st.text(traceback.format_exc())

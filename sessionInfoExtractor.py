@@ -91,7 +91,8 @@ def add_events_to_sessions(metadata):
                 7: "event 7",
                 9: "event 9",
                 8: "event 8",
-                100: "event 100"
+                100: "event 100",
+                99: "event 99"
             }
 
             data['events'] = get_events(data_temp,code_map)
