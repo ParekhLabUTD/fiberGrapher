@@ -1,54 +1,220 @@
-# Full Math Audit & Data Flow Documentation
+# Full Data Audit — Every Step the Data Goes Through
 
-## Pipeline 1: Batch Processing ([batchProcessing.py](file:///d:/Aryan/fiberGrapher/batchProcessing.py))
+> [!NOTE]
+> Last updated: 2026-04-23. Reflects per-channel signal splicing across all tabs.
 
-### Raw Data → dF/F
+---
+
+## Splice System Overview
+
+Splice definitions are stored per-channel inside each TDT block folder:
+
+| File | Purpose |
+|---|---|
+| `splices_ch1.txt` | Channel 1 splice regions |
+| `splices_ch2.txt` | Channel 2 splice regions |
+| `splices.txt` | Legacy fallback (treated as Channel 1) |
+
+Each line: `start_seconds,end_seconds` (raw TDT block time, pre-alignment).
 
 ```mermaid
-graph TD
-    A["TDT Block (raw)"] --> B["Read streams: sig = _465A/C, ctrl = _415A/C"]
-    B --> C["Downsample: sig[::ds], ctrl[::ds], fs = fs_orig / ds"]
-    C --> D["Truncate to equal length: min(len sig, len ctrl)"]
-    D --> E["Linear regression: p = polyfit(ctrl, sig, 1)"]
-    E --> F["Fitted control: fitted = p[0] * ctrl + p[1]"]
-    F --> G["dF/F = 100 × (sig − fitted) / (fitted + 1e-12)"]
+graph LR
+    RAW["splices_chN.txt (raw TDT seconds)"] --> OFF["offset_splices: subtract alignment offset"]
+    OFF --> DISP["display_splices (graph coordinates)"]
+    DISP --> MASK["get_splice_mask → boolean array (True=keep)"]
+    DISP --> OVERLAP["check_snippet_overlaps_splice → skip trial?"]
 ```
 
-### dF/F → Per-Trial Z-Scored Snippets
+---
+
+## Pipeline 1: Tab 2 — Graph Viewer (`graphApp.py` `compute_trace`)
+
+### Step-by-step data flow
 
 ```mermaid
 graph TD
-    G["dF/F (full session)"] --> H["For each event timestamp ts:"]
-    H --> I["Extract snippet: dff[ts−pre : ts+post]"]
-    I --> J{"Baseline window indices valid?"}
-    J -->|yes| K["baseline_vals = snippet[bl_start : bl_end]"]
-    J -->|no| K2["Fallback: use snippet[0 : pre_t] or global mean"]
-    K --> L["μ = mean(baseline_vals), σ = std(baseline_vals)"]
-    L --> M{"σ > 0?"}
-    M -->|yes| N["snippet_z = (snippet − μ) / σ"]
-    M -->|no| N2["snippet_z = snippet − μ (not z-scored)"]
-    K2 --> L
+    A["TDT Block (raw arrays)"] --> A1["signal = extracted_data.signal{1|2}"]
+    A --> A2["control = extracted_data.control{1|2}"]
+    A --> A3["fs = extracted_data.fs"]
+    A1 --> B["Pre-downsample clamp: min_len = min(len sig, len ctrl)"]
+    A2 --> B
+    B --> C["Downsample by averaging blocks of N samples:<br/>signal_ds[i] = mean(signal[i*N : (i+1)*N])<br/>control_ds[i] = mean(control[i*N : (i+1)*N])"]
+    C --> D["time = arange(len signal_ds) / fs * N"]
+    D --> E["PCT alignment: time -= offset<br/>Keep only time ≥ 0 (trim start)"]
+    E --> F["Truncate signal_ds, control_ds, time to equal length"]
+```
+
+### Regression + ΔF/F + Z-score
+
+```mermaid
+graph TD
+    F["Aligned, downsampled arrays"] --> G{"Channel has splices?"}
+    G -->|yes| H["smask = get_splice_mask(len, ds_fs, display_splices)<br/>ds_fs = fs / downsample_factor"]
+    G -->|no| I["Use all samples"]
+    H --> J["p = polyfit(control_ds[smask], signal_ds[smask], 1)"]
+    I --> J2["p = polyfit(control_ds, signal_ds, 1)"]
+    J --> K["fitted = p[0] × control_ds + p[1]<br/>(computed for ALL samples)"]
+    J2 --> K
+    K --> L["dF = 100 × (signal_ds − fitted) / fitted<br/>(computed for ALL samples — spliced values meaningless)"]
+    L --> M{"Has splices?"}
+    M -->|yes| N["dF_clean = dF[smask] (non-spliced only)<br/>μ = mean(dF_clean), σ = std(dF_clean)"]
+    M -->|no| N2["μ = mean(dF), σ = std(dF)"]
+    N --> O["dF_z = (dF − μ) / σ  (applied to ALL samples)"]
+    N2 --> O
+```
+
+> [!IMPORTANT]
+> **polyfit** uses only non-spliced samples → clean regression line.
+> **ΔF/F** is computed for ALL samples (spliced values exist but are meaningless).
+> **Z-score mean/std** are computed only from non-spliced ΔF/F values.
+> **Spliced samples are removed** in Graph 2 and exports (post-computation).
+
+### Graph 1: Full Trace
+
+- Plots `time` vs `dF` or `dF_z` for each channel
+- Red `vrect` overlays for Channel 1 splices, orange for Channel 2
+- Dashed event lines overlaid
+
+### Graph 2: Spliced Trace
+
+```mermaid
+graph LR
+    A["dF / dF_z (all samples)"] --> B["keep = get_splice_mask(len, ds_fs, ch_splices)"]
+    B --> C["time_clean = time[keep]<br/>dF_clean = dF[keep]<br/>dF_z_clean = dF_z[keep]"]
+    C --> D["Plot cleaned trace"]
+```
+
+### Exports (CSV / NPZ)
+
+Same masking as Graph 2. Each channel uses its own splice definitions.
+
+| Column | Content |
+|---|---|
+| `time_s` | Timepoints with spliced samples removed |
+| `dF_F_pct` | ΔF/F (%) at each kept timepoint |
+| `dF_F_zscore` | Z-scored ΔF/F at each kept timepoint |
+
+---
+
+## Pipeline 2: Tab 3 — Peri-Event Plots (`graphApp.py`)
+
+### Raw Data → ΔF/F
+
+```mermaid
+graph TD
+    A["signal = extracted_data.signal{signal_set}<br/>control = extracted_data.control{signal_set}<br/>fs = extracted_data.fs"]
+    A --> B{"PCT alignment enabled?"}
+    B -->|yes| C["offset = pct_onset − code12_times[1]<br/>Trim signal/control where time < 0"]
+    B -->|no| C2["No trimming"]
+    C --> D["Downsample: signal[::ds], control[::ds], fs /= ds"]
+    C2 --> D
+    D --> E["Truncate to min(len signal, len control)"]
+    E --> F["Load splices: load_splices(block, channel=signal_set)<br/>Adjust: offset_splices(raw, pct_offset)"]
+    F --> G{"Has splices?"}
+    G -->|yes| H["mask = get_splice_mask(min_len, fs, splices)<br/>fit = polyfit(control[mask], signal[mask], 1)"]
+    G -->|no| I["fit = polyfit(control, signal, 1)"]
+    H --> J["fitted = fit[0] × control + fit[1]<br/>dFF = 100 × (signal − fitted) / fitted"]
+    I --> J
+```
+
+### ΔF/F → Per-Event Snippets
+
+```mermaid
+graph TD
+    J["dFF (full trace, all samples)"] --> K["For each event matching event_name:"]
+    K --> L{"Peri-event window overlaps a splice?"}
+    L -->|yes| SKIP["SKIP this trial entirely"]
+    L -->|no| M["snippet = dFF[event − pre : event + post]"]
+    M --> N{"Baseline mode?"}
+    N -->|yes| O["baseline_vals = dFF[event+lowerBound : event+upperBound]<br/>μ = mean(baseline_vals), σ = std(baseline_vals)<br/>snippet = (snippet − μ) / σ"]
+    N -->|no| P{"Has splices?"}
+    P -->|yes| Q["dFF_clean = dFF[mask] (non-spliced only)<br/>μ = mean(dFF_clean), σ = std(dFF_clean)"]
+    P -->|no| Q2["μ = mean(dFF), σ = std(dFF)"]
+    Q --> R["snippet = (snippet − μ) / σ"]
+    Q2 --> R
+    O --> S["Append to snippets"]
+    R --> S
+```
+
+> [!IMPORTANT]
+> **Global z-score** mean/std exclude spliced samples from the full trace.
+> **Baseline z-score** uses each trial's own baseline window (trials overlapping splices are already skipped, so baseline windows are clean).
+
+### Final Plot
+
+```mermaid
+graph LR
+    S["snippets array (n_trials × n_timepoints)"] --> T["mean_snip = mean(snippets, axis=0)"]
+    S --> U["std_snip = std(snippets, axis=0)"]
+    T --> V["Plot: mean ± std, individual traces in gray"]
+    U --> V
+```
+
+---
+
+## Pipeline 3: Tab 4 — Batch Processing (`batchProcessing.py`)
+
+### Raw Data → ΔF/F
+
+```mermaid
+graph TD
+    A["TDT Block (raw)"] --> B["scs = meta.signalChannelSet (1 or 2)"]
+    B --> C["scs=1: sig=_465A, ctrl=_415A<br/>scs=2: sig=_465C, ctrl=_415C"]
+    C --> D["Read streams: sig, ctrl, fs_orig"]
+    D --> E{"interpretor == 2?<br/>(PCT alignment)"}
+    E -->|yes| F["offset = pct_onset − code12_times[1]<br/>Trim signal/control where time < 0<br/>Shift event_times by −offset"]
+    E -->|no| F2["offset = 0.0"]
+    F --> G["Load splices: load_splices(block_path, channel=scs)"]
+    F2 --> G
+    G --> H["block_splices = offset_splices(raw_splices, offset)"]
+    H --> I["Downsample: sig[::ds], ctrl[::ds], fs = fs_orig / ds"]
+    I --> J["Truncate to min(len sig, len ctrl)"]
+    J --> K{"Has splices?"}
+    K -->|yes| L["splice_mask = get_splice_mask(min_len, fs, block_splices)<br/>p = polyfit(ctrl[splice_mask], sig[splice_mask], 1)"]
+    K -->|no| M["p = polyfit(ctrl, sig, 1)"]
+    L --> N["fitted = p[0] × ctrl + p[1]<br/>dff = 100 × (sig − fitted) / (fitted + 1e-12)"]
+    M --> N
 ```
 
 > [!NOTE]
-> **Baseline z-scoring**: `std()` uses `ddof=0` (NumPy default = population std). Each trial is independently z-scored against its own baseline window.
+> The `1e-12` epsilon in the denominator prevents division by zero. Tab 2 and Tab 3 do NOT use this epsilon — they divide by `fitted` directly.
+
+### ΔF/F → Per-Trial Z-Scored Snippets
+
+```mermaid
+graph TD
+    N["dff (full session)"] --> O["For each event timestamp ts:"]
+    O --> P{"start_idx < 0 OR end_idx > len(dff)?"}
+    P -->|yes| SKIP1["Skip: out of bounds"]
+    P -->|no| Q{"Peri-event window overlaps a splice region?"}
+    Q -->|yes| SKIP2["Skip: splice overlap"]
+    Q -->|no| R["snippet = dff[ts−pre : ts+post]"]
+    R --> S["baseline_vals = snippet[bl_start_rel : bl_end_rel]"]
+    S --> T["μ = mean(baseline_vals), σ = std(baseline_vals)"]
+    T --> U{"σ > 0?"}
+    U -->|yes| V["snippet_z = (snippet − μ) / σ"]
+    U -->|no| V2["snippet_z = snippet − μ (not z-scored)"]
+```
+
+> [!IMPORTANT]
+> Batch processing always uses **per-trial baseline z-scoring** (never global). Trials overlapping splice regions are skipped entirely, so baseline windows cannot be contaminated by spliced data.
 
 ### Per-Trial Metrics
 
 ```mermaid
 graph TD
-    N["snippet_z (per trial)"] --> O["metric_segment = snippet_z[metric_start : metric_end]"]
-    O --> P["peak = max(metric_segment)"]
-    O --> Q["auc = trapz(metric_segment, dx=1/fs)"]
-    O --> R["latency = argmax(metric_segment) / fs + metric_start"]
+    V["snippet_z (per trial)"] --> W["metric_segment = snippet_z[metric_start : metric_end]"]
+    W --> X["peak = max(metric_segment)"]
+    W --> Y["auc = trapz(metric_segment, dx=1/fs)"]
+    W --> Z["latency = argmax(metric_segment) / fs + metric_start"]
 ```
 
 > [!WARNING]
-> **AUC uses `dx=1/fs`** (uniform spacing), NOT `np.trapz(y, x)` with actual time values. This is correct IF the snippet is uniformly sampled (which it is after downsampling). However, it means AUC units are **signal_z × seconds**.
+> **AUC uses `dx=1/fs`** (uniform spacing), NOT `np.trapz(y, x)` with time values. Units are **signal_z × seconds**.
 
 ---
 
-### Output File Flowcharts
+### Batch Output Files
 
 #### 1. Session Prism CSV (`prism_tables/sessions/{mouse}_{session}_prism.csv`)
 
@@ -61,35 +227,17 @@ graph LR
     D --> E
 ```
 
-**Columns**: `time_s`, [mean](file:///d:/Aryan/fiberGrapher/advanced_graphing.py#481-528), `sem` — the session-averaged peri-event trace.
-
 #### 2. Session Metrics CSV (`mice/{mouse}/{session}_metrics.csv`)
 
-```mermaid
-graph LR
-    A["Per-trial: peak, auc, latency"] --> B["DataFrame of all trials"]
-    B --> C["CSV: group, mouse, session, trial_index, peak, auc, latency, n_timepoints, zscored, fs, signalChannelSet"]
-```
-
-**1 row per trial** with: peak, auc (trapz), latency, zscored flag, fs, signalChannelSet.
+**1 row per valid trial**: group, mouse, session, trial_index, peak, auc, latency, n_timepoints, zscored, fs, signalChannelSet.
 
 #### 3. LONG Traces CSV (`mice/{mouse}/{session}_peri_event_traces_LONG.csv`)
 
-```mermaid
-graph LR
-    A["peri_arr: trials × timepoints"] --> B["Reshape to long format"]
-    B --> C["CSV: trial_index, global_time_s, time_idx, time_s, signal_z, mouse, group, session, fs, signalChannelSet"]
-```
-
-**1 row per timepoint per trial**. The `signal_z` column contains z-scored dF/F values.
+**1 row per timepoint per trial**: trial_index, global_time_s, time_idx, time_s, signal_z, mouse, group, session, fs, signalChannelSet.
 
 #### 4. Session Average Plot (`mice/{mouse}/{session}_session_avg.png`)
 
-```mermaid
-graph LR
-    A["session_mean ± session_sem"] --> B["Line plot with SEM shading"]
-    B --> C["Vertical line at t=0"]
-```
+Line plot: session_mean ± session_sem with vertical line at t=0.
 
 #### 5. Mouse Prism CSV (`prism_tables/mice/{mouse}_combined_prism.csv`)
 
@@ -103,75 +251,44 @@ graph LR
 ```
 
 > [!IMPORTANT]
-> **This pools individual trials, not session means.** If Mouse1 has 10 trials from Session1 and 5 from Session2, the mouse mean is computed across all 15 trials — Session1 carries double the weight.
+> Pools individual trials, not session means. Sessions with more valid trials carry more weight.
 
 #### 6. Group Summary Metrics CSV (`groups/{group}/{group}_summary_metrics.csv`)
 
-```mermaid
-graph LR
-    A["Per-mouse, per-group trial metrics"] --> B["mean_peak = mean of all trial peaks for this mouse"]
-    A --> C["mean_auc = mean of all trial AUCs for this mouse"]
-    A --> D["mean_latency = mean of all trial latencies"]
-    B --> E["CSV: group, mouse, mean_peak, mean_auc, mean_latency, n_trials"]
-    C --> E
-    D --> E
-```
-
-**1 row per mouse** in the group. Metrics are means across all trials (not session means).
+**1 row per mouse**: mean_peak, mean_auc, mean_latency, n_trials — means across all that mouse's trials.
 
 #### 7. Group Mean Trace Plot (`groups/{group}/{group}_mean_trace.png`)
 
 ```mermaid
 graph LR
-    A["Per-mouse mean traces (trial-pooled)"] --> B["arr = vstack(mouse_means)"]
+    A["Per-mouse mean traces"] --> B["arr = vstack(mouse_means)"]
     B --> C["group_mean = mean(arr, axis=0) — mean across mice"]
     B --> D["group_sem = std(arr, axis=0) / √n_mice"]
-    C --> E["Line plot: group mean ± SEM"]
-    A --> F["Overlay: each mouse mean trace"]
-    E --> G["Combined plot"]
-    F --> G
+    C --> E["Plot: group mean ± SEM + individual mouse traces"]
+    D --> E
 ```
 
 > [!IMPORTANT]
-> **Group mean is mean of mouse means** (each mouse weighted equally), which is correct for between-subjects analysis.
+> Group mean = mean of mouse means (each mouse weighted equally).
 
 #### 8. Group Prism CSV (`prism_tables/groups/{group}_group_mean_prism.csv`)
 
-Same data as plot #7: `time_s`, [mean](file:///d:/Aryan/fiberGrapher/advanced_graphing.py#481-528), `sem` — group-averaged trace.
+Same data as plot #7: `time_s`, `mean`, `sem`.
 
-#### 9. Group Comparison Plot (`comparison/{event}_group_comparison.png`)
+#### 9. Group Comparison Plot + CSV
 
-```mermaid
-graph LR
-    A["Group means + SEMs from each group"] --> B["Overlay all groups on one plot"]
-    B --> C["Each group: mean ± SEM shading, different color"]
-```
+All group means overlaid. CSV columns: `time_s, {group1}_mean, {group1}_sem, ...`
 
-#### 10. Group Comparison Prism CSV (`prism_tables/comparison/{event}_group_comparison_prism.csv`)
+#### 10. Master CSVs
 
-**Columns**: `time_s, {group1}_mean, {group1}_sem, {group2}_mean, {group2}_sem, ...`
-
-#### 11. Master Trial Metrics CSV (`all_groups_trial_metrics.csv`)
-
-```mermaid
-graph LR
-    A["All trial metric rows from all sessions"] --> B["Concatenated DataFrame"]
-    B --> C["CSV: group, mouse, session, trial_index, peak, auc, latency, ..."]
-```
-
-**1 row per trial across ALL mice and sessions.**
-
-#### 12. Master LONG Traces CSV (`all_groups_peri_event_traces_LONG.csv`)
-
-All individual session LONG DataFrames concatenated. **1 row per timepoint per trial across everything.**
+- `all_groups_trial_metrics.csv` — 1 row per trial across everything
+- `all_groups_peri_event_traces_LONG.csv` — all LONG DataFrames concatenated
 
 ---
 
-## Pipeline 2: Advanced Graphing ([advanced_graphing.py](file:///d:/Aryan/fiberGrapher/advanced_graphing.py))
+## Pipeline 4: Tab 5 — Advanced Graphing (`advanced_graphing.py`)
 
-This pipeline reads CSVs from Pipeline 1 and generates additional visualizations.
-
-### Input Data Sources
+Operates entirely on CSV outputs from Pipeline 3. **No raw TDT data is re-read.** Splices were already applied during batch processing, so all data is inherently clean.
 
 ```mermaid
 graph TD
@@ -183,89 +300,29 @@ graph TD
     F -->|no| FB["Fallback: session mean only (n = 1)"]
 ```
 
-#### Signal Mean Bar Plot (`*_signal_mean_bars.png`)
+#### Signal Mean Bar Plot
 
-```mermaid
-graph TD
-    A["LONG CSV trial data"] --> B["For each trial: mean(signal_z) in baseline window"]
-    A --> C["For each trial: mean(signal_z) in response window"]
-    B --> D["baseline_stats: mean, std, n of per-trial means"]
-    C --> E["response_stats: mean, std, n of per-trial means"]
-    D --> F["Bar chart: Baseline vs Response ± stddev"]
-    E --> F
-```
+**Math**: For each trial → `mean(signal_z)` in baseline/response window → `mean(trial_means)`, `stddev(trial_means, ddof=0)`.
 
-**Math**: `trial_means[i] = mean(signal_z[t ∈ window])` per trial → `mean = mean(trial_means)`, `stddev = std(trial_means, ddof=0)`
+#### AUC Bar Plot
 
-#### AUC Bar Plot (`*_auc_bars.png`)
-
-```mermaid
-graph TD
-    A["LONG CSV trial data"] --> B["For each trial: trapz(signal_z, time_s) in baseline window"]
-    A --> C["For each trial: trapz(signal_z, time_s) in response window"]
-    B --> D["baseline_auc: mean, std, n of per-trial AUCs"]
-    C --> E["response_auc: mean, std, n of per-trial AUCs"]
-    D --> F["Bar chart: Baseline vs Response AUC ± stddev"]
-    E --> F
-```
-
-**Math**: `trial_aucs[i] = trapz(signal_z, time_s)` per trial → `mean = mean(trial_aucs)`, `stddev = std(trial_aucs, ddof=0)`
+**Math**: For each trial → `trapz(signal_z, time_s)` in window → `mean(trial_aucs)`, `stddev(trial_aucs, ddof=0)`.
 
 > [!NOTE]
-> Unlike batchProcessing which uses `dx=1/fs`, advanced_graphing uses `np.trapz(y, x)` with actual time values. Both are correct but use slightly different integration methods.
+> Uses `np.trapz(y, x)` with actual time values (vs batch processing which uses `dx=1/fs`).
 
-#### Heatmap (`*_heatmap.png`)
+#### Heatmap
 
-```mermaid
-graph TD
-    A["LONG CSV trial data"] --> B["Pivot: rows=trial_index, cols=time_idx, values=signal_z"]
-    B --> C["Color limits: ±percentile(abs(values), 98th)"]
-    C --> D["imshow: RdBu_r colormap, symmetric scaling"]
-    D --> E["Vertical line at t=0"]
-```
-
-#### Session Stats CSV (`*_stats.csv`)
-
-```mermaid
-graph LR
-    A["baseline_signal + response_signal"] --> B["Row 1: baseline — signal_mean, signal_stddev, signal_n"]
-    A --> C["Row 2: response — signal_mean, signal_stddev, signal_n"]
-    D["baseline_auc + response_auc"] --> E["+ auc_mean, auc_stddev, auc_n"]
-    B --> F["CSV with metadata: mouse, session, group, signal_type, windows"]
-    C --> F
-    E --> F
-```
-
-#### Aggregated Stats CSV (`aggregated_session_stats.csv`)
-
-```mermaid
-graph TD
-    A["All session stats dicts"] --> B["1 row per session: baseline/response signal_mean, stddev, n + auc_mean, stddev, n"]
-    B --> C["+ MEAN_ACROSS_SESSIONS summary row"]
-    B --> D["+ STDDEV_ACROSS_SESSIONS summary row"]
-    C --> E["CSV"]
-    D --> E
-```
-
-> [!WARNING]
-> The summary rows compute [mean()](file:///d:/Aryan/fiberGrapher/advanced_graphing.py#481-528)/`std()` of the per-session **n** column too, which is meaningless (it averages the trial counts). Consider dropping `n` columns from the summary computation.
+Pivot trial data → matrix (rows=trials, cols=timepoints). Color limits: `±percentile(|values|, 98th)`. Colormap: `RdBu_r`.
 
 ---
 
-## Issues Found
+## Known Design Decisions
 
-### 1. Group summary metrics source data mismatch
-
-In [batchProcessing.py](file:///d:/Aryan/fiberGrapher/batchProcessing.py) lines 534–540, the `per_group_mouse_metrics_rows` are built from `per_mouse_summary_metrics_by_group`, which stores the **per-trial** metric rows (peak, auc, latency). These metrics come from the **z-scored snippet** computed per-trial during batch processing.
-
-The user requested these metrics come from the **prism data** instead. Currently the prism CSV only stores `time_s, mean, sem` (the session-averaged trace) — it doesn't contain per-trial metrics like peak/auc/latency.
-
-**To use prism data for summary metrics**: We could compute peak/auc/latency from the prism session mean trace, but this would give one value per session (not per trial). This changes the meaning of `n_trials` in the summary.
-
-### 2. `std(ddof=0)` used throughout
-
-Both pipelines use population standard deviation. This is consistent but worth noting — some scientific conventions prefer `ddof=1` (sample std) or SEM.
-
-### 3. Mouse-level pooling weights trials, not sessions
-
-When computing mouse-mean traces, all trials are pooled equally. A session with 20 trials has 4× the weight of a session with 5 trials. This is a design choice, not a bug — but different from computing session means first, then averaging (which weights sessions equally).
+| Item | Behavior |
+|---|---|
+| `std(ddof=0)` | Population std used everywhere (NumPy default) |
+| Mouse pooling | Trials pooled, not session means — unequal trial counts cause unequal weighting |
+| Splice masking vs deletion | Polyfit excludes spliced samples; ΔF/F computed for all; spliced samples removed post-hoc for graphs/exports |
+| ΔF/F denominator | Batch uses `fitted + 1e-12`; Tabs 2/3 use `fitted` directly |
+| AUC method | Batch: `trapz(y, dx=1/fs)`; Advanced: `trapz(y, x)` |

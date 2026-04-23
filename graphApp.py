@@ -241,10 +241,14 @@ with tab3:
                             snippet = snippet - baseline_mean
                 else:
                     # ----------------------------
-                    # Global z-scoring (whole trace)
+                    # Global z-scoring (whole trace, excluding spliced regions)
                     # ----------------------------
-                    trace_mean = np.mean(dFF)
-                    trace_std = np.std(dFF)
+                    if _t3_splices:
+                        _t3_clean_dFF = dFF[_t3_mask]
+                    else:
+                        _t3_clean_dFF = dFF
+                    trace_mean = np.mean(_t3_clean_dFF)
+                    trace_std = np.std(_t3_clean_dFF)
                     snippet = (snippet - trace_mean) / (trace_std if trace_std > 0 else 1.0)
 
                 snippets.append(snippet)
@@ -620,7 +624,13 @@ with tab2:
 
             fitted = fit[0] * control_ds + fit[1]
             dF = 100 * ((signal_ds - fitted) / fitted)
-            dF_z = (dF - np.mean(dF)) / np.std(dF)
+
+            # Z-score: compute mean/std only on non-spliced samples
+            if ch_display_splices:
+                dF_clean = dF[smask]
+            else:
+                dF_clean = dF
+            dF_z = (dF - np.mean(dF_clean)) / (np.std(dF_clean) if np.std(dF_clean) > 0 else 1.0)
 
             trace_results[label_prefix] = {
                 "time": time, "dF": dF, "dF_z": dF_z
