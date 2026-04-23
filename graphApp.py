@@ -133,26 +133,34 @@ with tab3:
             st.error("Signal or control data missing.")
         else:
             # --- Optional PCT alignment ---
-            apply_pct_alignment = st.checkbox("Align signal to PCT's 2nd onset (code 12)", value=False)
+            apply_pct_alignment = st.checkbox("Align signal to PCT onset (code 12)", value=False, key="peri_pct_align")
             if apply_pct_alignment:
+                peri_code12_choice = st.selectbox(
+                    "Which code 12 occurrence to use for alignment?",
+                    ["1st code 12", "2nd code 12"],
+                    index=1,
+                    key="peri_code12_choice"
+                )
+                peri_code12_idx = 0 if peri_code12_choice == "1st code 12" else 1
                 try:
                     pct = st.session_state.extracted_data.get("pct", [])
                     events = st.session_state.extracted_data.get("events", [])
-                    if len(pct) < 2:
-                        st.warning("Less than 2 PCT onsets found — skipping alignment.")
+                    required_pct = peri_code12_idx + 1
+                    if len(pct) < required_pct:
+                        st.warning(f"Less than {required_pct} PCT onset(s) found — skipping alignment.")
                     else:
-                        pct_onset = float(pct[1])
+                        pct_onset = float(pct[peri_code12_idx])
                         code12_times = [e["timestamp_s"] for e in events if e.get("code") == 12]
-                        if len(code12_times) < 2:
-                            st.warning("Less than 2 code-12 events found — skipping alignment.")
+                        if len(code12_times) < required_pct:
+                            st.warning(f"Less than {required_pct} code-12 event(s) found — skipping alignment.")
                         else:
-                            offset = pct_onset - code12_times[1]
+                            offset = pct_onset - code12_times[peri_code12_idx]
                             time_full = np.arange(len(signal)) / fs
                             time_full -= offset
                             valid = time_full >= 0
                             signal = signal[valid]
                             control = control[valid]
-                            st.info(f"Applied PCT alignment offset of {offset:.3f} s")
+                            st.info(f"Applied PCT alignment using {peri_code12_choice}, offset = {offset:.3f} s")
                 except Exception as e:
                     st.warning(f"Alignment failed: {e}")
             # Downsample
@@ -390,10 +398,18 @@ with tab2:
     st.title("Fiber Photometry Grapher (Interactive)")
 
     downsample_factor = st.number_input("Downsampling factor", min_value=1, value=100)
-    cutoff_time_from_pct = st.checkbox("Use PCT's 2nd event (code 12) to align all events?", value=False)
+    cutoff_time_from_pct = st.checkbox("Use PCT event (code 12) to align all events?", value=False)
     if cutoff_time_from_pct:
+        graph_code12_choice = st.selectbox(
+            "Which code 12 occurrence to use for alignment?",
+            ["1st code 12", "2nd code 12"],
+            index=1,
+            key="graph_code12_choice"
+        )
+        graph_code12_idx = 0 if graph_code12_choice == "1st code 12" else 1
         cutoff_time = 0
     else:
+        graph_code12_idx = 1  # default, unused when PCT alignment is off
         cutoff_time = st.number_input("Start time (seconds)", min_value=0.0, value=2.0)
 
     plot_choice = st.radio("Plot Type", ["ΔF/F", "Z-scored ΔF/F"])
@@ -424,9 +440,10 @@ with tab2:
             st.stop()
         data = st.session_state.extracted_data
         try:
-            pct_onset = data["pct"][1]
+            required_pct = graph_code12_idx + 1
+            pct_onset = data["pct"][graph_code12_idx]
             code12_times = [e["timestamp_s"] for e in data["events"] if e["code"] == 12]
-            offset = pct_onset - code12_times[1]
+            offset = pct_onset - code12_times[graph_code12_idx]
         except:
             #add logic when skipping the pct line up
             offset=cutoff_time
@@ -690,6 +707,13 @@ with tab4:
         else:
             st.markdown("### Event & Processing Options")
             selected_event = st.selectbox("Select event (one):", event_names)
+            batch_code12_choice = st.selectbox(
+                "Which code 12 occurrence to use for PCT alignment?",
+                ["1st code 12", "2nd code 12"],
+                index=1,
+                key="batch_code12_choice"
+            )
+            batch_code12_idx = 0 if batch_code12_choice == "1st code 12" else 1
             pre_t = st.number_input("Peri-event PRE time (s)", min_value=0.0, value=5.0)
             post_t = st.number_input("Peri-event POST time (s)", min_value=0.0, value=10.0)
             baseline_lower = st.number_input("Baseline window start (s, relative to T0, negative)", value=-4.0)
@@ -728,6 +752,7 @@ with tab4:
                                 find_stream_by_substr=find_stream_by_substr,
                                 load_tdt_block=load_tdt_block,
                                 verbose=True,
+                                code12_index=batch_code12_idx,
                             )
                             st.success(f"Processing complete. Output folder: {summary['output_files']['event_folder']}")
                             st.write(summary)  # visible run summary in the UI
