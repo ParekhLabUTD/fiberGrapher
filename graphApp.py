@@ -170,9 +170,10 @@ with tab3:
 
             # --- Load splices for regression masking ---
             _t3_block = st.session_state.tdt_settings.get("block_folder", "")
+            _t3_channel = int(signal_set)
             _t3_raw_splices = []
             if _t3_block and os.path.isdir(_t3_block):
-                _t3_raw_splices = load_splices(_t3_block)
+                _t3_raw_splices = load_splices(_t3_block, channel=_t3_channel)
             # Adjust splice times for any PCT offset applied above
             try:
                 _t3_offset = offset  # set if PCT alignment ran
@@ -453,14 +454,30 @@ with tab2:
 
     _splice_block_path = st.session_state.tdt_settings.get("block_folder", "")
 
-    # Auto-load splices when block folder is available
     if _splice_block_path and os.path.isdir(_splice_block_path):
-        if "splices" not in st.session_state or st.session_state.get("_splice_block") != _splice_block_path:
-            st.session_state["splices"] = load_splices(_splice_block_path)
+        # --- Channel selector ---
+        _has_ch2 = show_second_channel
+        _avail_channels = ["Channel 1", "Channel 2"] if _has_ch2 else ["Channel 1"]
+        _splice_ch_label = st.radio("Edit splices for:", _avail_channels, horizontal=True, key="splice_ch_radio")
+        _splice_ch = 1 if _splice_ch_label == "Channel 1" else 2
+        _sk1 = "splices_ch1"
+        _sk2 = "splices_ch2"
+
+        # Auto-load splices per channel when block folder changes
+        if st.session_state.get("_splice_block") != _splice_block_path:
+            st.session_state[_sk1] = load_splices(_splice_block_path, channel=1)
+            st.session_state[_sk2] = load_splices(_splice_block_path, channel=2)
             st.session_state["_splice_block"] = _splice_block_path
+        # Ensure keys exist
+        if _sk1 not in st.session_state:
+            st.session_state[_sk1] = load_splices(_splice_block_path, channel=1)
+        if _sk2 not in st.session_state:
+            st.session_state[_sk2] = load_splices(_splice_block_path, channel=2)
+
+        _active_sk = _sk1 if _splice_ch == 1 else _sk2
 
         # Compute display offset early so splice UI can reference it
-        _splice_offset = cutoff_time  # default
+        _splice_offset = cutoff_time
         if "extracted_data" in st.session_state:
             try:
                 _d = st.session_state.extracted_data
@@ -486,30 +503,29 @@ with tab2:
         with col_add:
             if st.button("➕ Add Splice"):
                 if splice_end_input > splice_start_input:
-                    # Convert displayed time → raw time for storage
                     raw_start = splice_start_input + _splice_offset
                     raw_end = splice_end_input + _splice_offset
-                    st.session_state["splices"].append((raw_start, raw_end))
-                    st.session_state["splices"].sort(key=lambda x: x[0])
-                    save_splices(_splice_block_path, st.session_state["splices"])
-                    st.success(f"Added splice: {splice_start_input:.2f}s → {splice_end_input:.2f}s (graph time)")
+                    st.session_state[_active_sk].append((raw_start, raw_end))
+                    st.session_state[_active_sk].sort(key=lambda x: x[0])
+                    save_splices(_splice_block_path, st.session_state[_active_sk], channel=_splice_ch)
+                    st.success(f"Added splice to {_splice_ch_label}: {splice_start_input:.2f}s → {splice_end_input:.2f}s")
                     st.rerun()
                 else:
                     st.error("Splice end must be > splice start.")
         with col_save:
             if st.button("💾 Save Splices"):
-                save_splices(_splice_block_path, st.session_state.get("splices", []))
-                st.success(f"Saved {len(st.session_state.get('splices', []))} splice(s).")
+                save_splices(_splice_block_path, st.session_state.get(_active_sk, []), channel=_splice_ch)
+                st.success(f"Saved {len(st.session_state.get(_active_sk, []))} splice(s) for {_splice_ch_label}.")
         with col_clear:
             if st.button("🗑️ Clear All Splices"):
-                st.session_state["splices"] = []
-                save_splices(_splice_block_path, [])
+                st.session_state[_active_sk] = []
+                save_splices(_splice_block_path, [], channel=_splice_ch)
                 st.rerun()
 
-        # Display existing splices with per-item delete
-        current_splices = st.session_state.get("splices", [])
+        # Display existing splices for the active channel
+        current_splices = st.session_state.get(_active_sk, [])
         if current_splices:
-            st.markdown("**Current Splices:**")
+            st.markdown(f"**Current Splices ({_splice_ch_label}):**")
             for i, (rs, re_) in enumerate(current_splices):
                 disp_s = rs - _splice_offset
                 disp_e = re_ - _splice_offset
@@ -517,9 +533,9 @@ with tab2:
                 with c1:
                     st.text(f"  #{i+1}: {disp_s:.2f}s → {disp_e:.2f}s  (duration: {re_ - rs:.2f}s)")
                 with c2:
-                    if st.button("🗑️", key=f"del_splice_{i}"):
-                        st.session_state["splices"].pop(i)
-                        save_splices(_splice_block_path, st.session_state["splices"])
+                    if st.button("🗑️", key=f"del_splice_{_splice_ch}_{i}"):
+                        st.session_state[_active_sk].pop(i)
+                        save_splices(_splice_block_path, st.session_state[_active_sk], channel=_splice_ch)
                         st.rerun()
     else:
         st.info("Load a TDT block in the Data Extractor tab to manage splices.")
@@ -538,18 +554,19 @@ with tab2:
         except:
             offset=cutoff_time
 
-        # Load splices for this block (raw time coordinates)
+        # Load per-channel splices
         _block_path = st.session_state.tdt_settings.get("block_folder", "")
-        raw_splices = []
+        raw_splices_ch1, raw_splices_ch2 = [], []
         if _block_path and os.path.isdir(_block_path):
-            raw_splices = load_splices(_block_path)
-        # Convert to display coordinates for graph overlay
-        display_splices = offset_splices(raw_splices, offset)
+            raw_splices_ch1 = load_splices(_block_path, channel=1)
+            raw_splices_ch2 = load_splices(_block_path, channel=2)
+        display_splices_ch1 = offset_splices(raw_splices_ch1, offset)
+        display_splices_ch2 = offset_splices(raw_splices_ch2, offset)
 
         # --- Compute traces and store in session_state ---
         trace_results = {}  # label -> {time, dF, dF_z}
 
-        def compute_trace(signal, control, label_prefix):
+        def compute_trace(signal, control, label_prefix, ch_display_splices):
             signal_ds = np.array([np.mean(signal[i_:i_+downsample_factor]) for i_ in range(0, len(signal), downsample_factor)])
             control_ds = np.array([np.mean(control[i_:i_+downsample_factor]) for i_ in range(0, len(control), downsample_factor)])
             time = np.arange(len(signal_ds)) / data["fs"] * downsample_factor
@@ -566,9 +583,9 @@ with tab2:
             time = time[:min_len_ds]
 
             # Use splice mask to exclude spliced samples from polyfit
-            if display_splices:
+            if ch_display_splices:
                 ds_fs = data["fs"] / downsample_factor
-                smask = get_splice_mask(len(signal_ds), ds_fs, display_splices)
+                smask = get_splice_mask(len(signal_ds), ds_fs, ch_display_splices)
                 fit = np.polyfit(control_ds[smask], signal_ds[smask], 1)
             else:
                 fit = np.polyfit(control_ds, signal_ds, 1)
@@ -581,13 +598,14 @@ with tab2:
                 "time": time, "dF": dF, "dF_z": dF_z
             }
 
-        compute_trace(data["signal1"], data["control1"], "Channel 1")
+        compute_trace(data["signal1"], data["control1"], "Channel 1", display_splices_ch1)
         if show_second_channel and data.get("signal2") is not None:
-            compute_trace(data["signal2"], data["control2"], "Channel 2")
+            compute_trace(data["signal2"], data["control2"], "Channel 2", display_splices_ch2)
 
         # Store computed data for persistent display and export
         st.session_state["tab2_traces"] = trace_results
-        st.session_state["tab2_display_splices"] = display_splices
+        st.session_state["tab2_display_splices_ch1"] = display_splices_ch1
+        st.session_state["tab2_display_splices_ch2"] = display_splices_ch2
         st.session_state["tab2_offset"] = offset
         st.session_state["tab2_plot_choice"] = plot_choice
         st.session_state["tab2_enabled_events"] = dict(enabled_events)
@@ -597,19 +615,20 @@ with tab2:
     # --- Render persisted plots (survives splice edits without re-generating) ---
     if "tab2_traces" in st.session_state:
         trace_results = st.session_state["tab2_traces"]
-        display_splices = st.session_state.get("tab2_display_splices", [])
         _plot_choice = st.session_state.get("tab2_plot_choice", "ΔF/F")
         _enabled_events = st.session_state.get("tab2_enabled_events", {})
         _code_colors = st.session_state.get("tab2_code_colors", {})
 
-        # Reload current splice state from file for overlay (always up-to-date)
+        # Reload current splice state per channel from file (always up-to-date)
         _bp = st.session_state.tdt_settings.get("block_folder", "")
         _off = st.session_state.get("tab2_offset", 0)
+        _ch_splices = {}  # label -> display splices
         if _bp and os.path.isdir(_bp):
-            _current_raw_splices = load_splices(_bp)
-            _current_display_splices = offset_splices(_current_raw_splices, _off)
+            _ch_splices["Channel 1"] = offset_splices(load_splices(_bp, channel=1), _off)
+            _ch_splices["Channel 2"] = offset_splices(load_splices(_bp, channel=2), _off)
         else:
-            _current_display_splices = display_splices
+            _ch_splices["Channel 1"] = st.session_state.get("tab2_display_splices_ch1", [])
+            _ch_splices["Channel 2"] = st.session_state.get("tab2_display_splices_ch2", [])
 
         # ========== GRAPH 1: Full trace with splice overlay ==========
         st.subheader("📈 Full Trace (with splice regions highlighted)")
@@ -625,15 +644,20 @@ with tab2:
                 line=dict(color=color),
             ))
 
-        # Splice overlays (shows current splices, updated without re-generating)
-        for s_start, s_end in _current_display_splices:
-            fig1.add_vrect(
-                x0=s_start, x1=s_end,
-                fillcolor="red", opacity=0.2,
-                layer="below", line_width=1, line_color="red",
-                annotation_text="splice", annotation_position="top left",
-                annotation_font_size=9, annotation_font_color="red",
-            )
+        # Per-channel splice overlays
+        _splice_colors = {"Channel 1": "red", "Channel 2": "orange"}
+        for ch_label in trace_results.keys():
+            for s_start, s_end in _ch_splices.get(ch_label, []):
+                fig1.add_vrect(
+                    x0=s_start, x1=s_end,
+                    fillcolor=_splice_colors.get(ch_label, "red"), opacity=0.2,
+                    layer="below", line_width=1,
+                    line_color=_splice_colors.get(ch_label, "red"),
+                    annotation_text=f"splice ({ch_label})",
+                    annotation_position="top left",
+                    annotation_font_size=8,
+                    annotation_font_color=_splice_colors.get(ch_label, "red"),
+                )
 
         # Event overlays
         if "extracted_data" in st.session_state and _enabled_events:
@@ -688,10 +712,11 @@ with tab2:
             time_arr = td["time"]
             dF_arr = td["dF"]
             dF_z_arr = td["dF_z"]
-            # Build keep mask from current splices
-            if _current_display_splices:
+            # Build keep mask from this channel's splices
+            _this_ch_splices = _ch_splices.get(label, [])
+            if _this_ch_splices:
                 ds_fs_out = 1.0 / np.median(np.diff(time_arr)) if len(time_arr) > 1 else 1.0
-                keep = get_splice_mask(len(time_arr), ds_fs_out, _current_display_splices)
+                keep = get_splice_mask(len(time_arr), ds_fs_out, _this_ch_splices)
             else:
                 keep = np.ones(len(time_arr), dtype=bool)
 
@@ -736,10 +761,11 @@ with tab2:
             dF_arr = td["dF"]
             dF_z_arr = td["dF_z"]
 
-            # Apply current splices
-            if _current_display_splices:
+            # Apply this channel's splices
+            _this_ch_splices = _ch_splices.get(label, [])
+            if _this_ch_splices:
                 ds_fs_out = 1.0 / np.median(np.diff(time_arr)) if len(time_arr) > 1 else 1.0
-                keep = get_splice_mask(len(time_arr), ds_fs_out, _current_display_splices)
+                keep = get_splice_mask(len(time_arr), ds_fs_out, _this_ch_splices)
             else:
                 keep = np.ones(len(time_arr), dtype=bool)
 

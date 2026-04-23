@@ -2,6 +2,8 @@
 Signal splice utilities for fiber photometry data.
 
 Splice files are plain-text files stored inside each TDT block folder.
+Per-channel files: splices_ch1.txt, splices_ch2.txt
+Legacy fallback:   splices.txt (treated as channel 1)
 Each non-comment line contains: start_seconds,end_seconds
 
 The masking approach:
@@ -16,23 +18,38 @@ The masking approach:
 import os
 import numpy as np
 
-SPLICE_FILENAME = "splices.txt"
+SPLICE_FILENAME_LEGACY = "splices.txt"
+
+
+def _splice_filename(channel: int = 1) -> str:
+    """Return the splice filename for a given channel number."""
+    return f"splices_ch{channel}.txt"
 
 
 # ---------------------------------------------------------------------------
 # File I/O
 # ---------------------------------------------------------------------------
 
-def load_splices(block_path: str) -> list:
-    """Load splice definitions from a TDT block folder.
+def load_splices(block_path: str, channel: int = 1) -> list:
+    """Load splice definitions from a TDT block folder for a specific channel.
+
+    Looks for ``splices_ch{channel}.txt`` first.  For channel 1 only, falls
+    back to the legacy ``splices.txt`` if the per-channel file doesn't exist.
 
     Returns a sorted list of (start_seconds, end_seconds) tuples.
     Returns an empty list if no splice file exists.
     """
-    splice_file = os.path.join(block_path, SPLICE_FILENAME)
-    splices = []
+    splice_file = os.path.join(block_path, _splice_filename(channel))
     if not os.path.exists(splice_file):
-        return splices
+        # Legacy fallback for channel 1
+        if channel == 1:
+            splice_file = os.path.join(block_path, SPLICE_FILENAME_LEGACY)
+            if not os.path.exists(splice_file):
+                return []
+        else:
+            return []
+
+    splices = []
     with open(splice_file, "r") as f:
         for line in f:
             line = line.strip()
@@ -51,13 +68,13 @@ def load_splices(block_path: str) -> list:
     return splices
 
 
-def save_splices(block_path: str, splices: list):
-    """Write splice definitions into the TDT block folder."""
-    splice_file = os.path.join(block_path, SPLICE_FILENAME)
+def save_splices(block_path: str, splices: list, channel: int = 1):
+    """Write splice definitions into the TDT block folder for a specific channel."""
+    splice_file = os.path.join(block_path, _splice_filename(channel))
     with open(splice_file, "w") as f:
         f.write(
             f"# Signal splice definitions for block: "
-            f"{os.path.basename(block_path)}\n"
+            f"{os.path.basename(block_path)} (channel {channel})\n"
         )
         f.write("# Each line: start_seconds,end_seconds\n")
         f.write("# Lines starting with # are comments\n")

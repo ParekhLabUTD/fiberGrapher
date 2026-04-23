@@ -242,8 +242,8 @@ def run_batch_processing(
                     summary["errors"].append({"session": s_path, "error": warn})
                     continue
 
-                # --- Load and adjust splices for this block ---
-                block_splices_raw = load_splices(s_path)
+                # --- Load and adjust splices for this block (per channel) ---
+                block_splices_raw = load_splices(s_path, channel=scs)
                 block_splices = offset_splices(block_splices_raw, offset) if block_splices_raw else []
                 if verbose and block_splices:
                     print(f"Loaded {len(block_splices)} splice region(s) for this block", flush=True)
