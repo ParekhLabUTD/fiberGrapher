@@ -2,6 +2,7 @@ import streamlit as st
 import numpy as np
 import tempfile
 import os
+import io
 import plotly.graph_objs as go
 import tdt
 import hashlib
@@ -14,6 +15,7 @@ import matplotlib
 from OHRBETsEventExtractor import parse_ohrbets_serial_log
 from nxtEventExtrator import readfile, get_events, get_event_codes
 from sessionInfoExtractor import *
+from splice_utils import load_splices, save_splices, get_splice_mask, check_snippet_overlaps_splice, offset_splices
 from batchProcessing import run_batch_processing
 from advanced_graphing import (
     run_advanced_graphing, discover_sessions,
@@ -174,8 +176,25 @@ with tab3:
                 signal = signal[:min_len]
                 control = control[:min_len]
 
-            # ΔF/F calculation
-            fit = np.polyfit(control, signal, 1)
+            # --- Load splices for regression masking ---
+            _t3_block = st.session_state.tdt_settings.get("block_folder", "")
+            _t3_channel = int(signal_set)
+            _t3_raw_splices = []
+            if _t3_block and os.path.isdir(_t3_block):
+                _t3_raw_splices = load_splices(_t3_block, channel=_t3_channel)
+            # Adjust splice times for any PCT offset applied above
+            try:
+                _t3_offset = offset  # set if PCT alignment ran
+            except NameError:
+                _t3_offset = 0.0
+            _t3_splices = offset_splices(_t3_raw_splices, _t3_offset) if _t3_raw_splices else []
+
+            # ΔF/F calculation (exclude spliced regions from polyfit)
+            if _t3_splices:
+                _t3_mask = get_splice_mask(min_len, fs, _t3_splices)
+                fit = np.polyfit(control[_t3_mask], signal[_t3_mask], 1)
+            else:
+                fit = np.polyfit(control, signal, 1)
             fitted = fit[0] * control + fit[1]
             dFF = 100 * (signal - fitted) / fitted
 
@@ -187,6 +206,10 @@ with tab3:
                     continue
                 on = event.get("timestamp_s")
                 if on is None or on * fs < -TRANGE[0] or (on * fs + TRANGE[1]) >= len(dFF):
+                    continue
+
+                # Skip events whose peri-event window overlaps a splice
+                if _t3_splices and check_snippet_overlaps_splice(on, PRE_TIME, POST_TIME, _t3_splices):
                     continue
 
                 idx = int(on * fs)
@@ -434,6 +457,107 @@ with tab2:
     if "signal2" in st.session_state.get("extracted_data", {}) and st.session_state.extracted_data["signal2"] is not None:
         show_second_channel = st.checkbox("Also graph Signal 2 and Control 2", value=True)
 
+    # =====================
+    # Signal Splicing UI
+    # =====================
+    st.markdown("---")
+    st.subheader("✂️ Signal Splicing")
+    st.caption(
+        "Define time regions to cut from the signal. Spliced regions are "
+        "excluded from regression and analysis. They appear as red shading "
+        "on the graph. Times are in the graph's displayed coordinate."
+    )
+
+    _splice_block_path = st.session_state.tdt_settings.get("block_folder", "")
+
+    if _splice_block_path and os.path.isdir(_splice_block_path):
+        # --- Channel selector ---
+        _has_ch2 = show_second_channel
+        _avail_channels = ["Channel 1", "Channel 2"] if _has_ch2 else ["Channel 1"]
+        _splice_ch_label = st.radio("Edit splices for:", _avail_channels, horizontal=True, key="splice_ch_radio")
+        _splice_ch = 1 if _splice_ch_label == "Channel 1" else 2
+        _sk1 = "splices_ch1"
+        _sk2 = "splices_ch2"
+
+        # Auto-load splices per channel when block folder changes
+        if st.session_state.get("_splice_block") != _splice_block_path:
+            st.session_state[_sk1] = load_splices(_splice_block_path, channel=1)
+            st.session_state[_sk2] = load_splices(_splice_block_path, channel=2)
+            st.session_state["_splice_block"] = _splice_block_path
+        # Ensure keys exist
+        if _sk1 not in st.session_state:
+            st.session_state[_sk1] = load_splices(_splice_block_path, channel=1)
+        if _sk2 not in st.session_state:
+            st.session_state[_sk2] = load_splices(_splice_block_path, channel=2)
+
+        _active_sk = _sk1 if _splice_ch == 1 else _sk2
+
+        # Compute display offset early so splice UI can reference it
+        _splice_offset = cutoff_time
+        if "extracted_data" in st.session_state:
+            try:
+                _d = st.session_state.extracted_data
+                _splice_offset = _d["pct"][1] - [
+                    e["timestamp_s"] for e in _d.get("events", []) if e.get("code") == 12
+                ][1]
+            except Exception:
+                _splice_offset = cutoff_time
+
+        col_ss, col_se = st.columns(2)
+        with col_ss:
+            splice_start_input = st.number_input(
+                "Splice start (s, graph time)", min_value=0.0, value=0.0,
+                step=0.1, format="%.2f", key="splice_start_input"
+            )
+        with col_se:
+            splice_end_input = st.number_input(
+                "Splice end (s, graph time)", min_value=0.0, value=1.0,
+                step=0.1, format="%.2f", key="splice_end_input"
+            )
+
+        col_add, col_save, col_clear = st.columns(3)
+        with col_add:
+            if st.button("➕ Add Splice"):
+                if splice_end_input > splice_start_input:
+                    raw_start = splice_start_input + _splice_offset
+                    raw_end = splice_end_input + _splice_offset
+                    st.session_state[_active_sk].append((raw_start, raw_end))
+                    st.session_state[_active_sk].sort(key=lambda x: x[0])
+                    save_splices(_splice_block_path, st.session_state[_active_sk], channel=_splice_ch)
+                    st.success(f"Added splice to {_splice_ch_label}: {splice_start_input:.2f}s → {splice_end_input:.2f}s")
+                    st.rerun()
+                else:
+                    st.error("Splice end must be > splice start.")
+        with col_save:
+            if st.button("💾 Save Splices"):
+                save_splices(_splice_block_path, st.session_state.get(_active_sk, []), channel=_splice_ch)
+                st.success(f"Saved {len(st.session_state.get(_active_sk, []))} splice(s) for {_splice_ch_label}.")
+        with col_clear:
+            if st.button("🗑️ Clear All Splices"):
+                st.session_state[_active_sk] = []
+                save_splices(_splice_block_path, [], channel=_splice_ch)
+                st.rerun()
+
+        # Display existing splices for the active channel
+        current_splices = st.session_state.get(_active_sk, [])
+        if current_splices:
+            st.markdown(f"**Current Splices ({_splice_ch_label}):**")
+            for i, (rs, re_) in enumerate(current_splices):
+                disp_s = rs - _splice_offset
+                disp_e = re_ - _splice_offset
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    st.text(f"  #{i+1}: {disp_s:.2f}s → {disp_e:.2f}s  (duration: {re_ - rs:.2f}s)")
+                with c2:
+                    if st.button("🗑️", key=f"del_splice_{_splice_ch}_{i}"):
+                        st.session_state[_active_sk].pop(i)
+                        save_splices(_splice_block_path, st.session_state[_active_sk], channel=_splice_ch)
+                        st.rerun()
+    else:
+        st.info("Load a TDT block in the Data Extractor tab to manage splices.")
+
+    st.markdown("---")
+
     if st.button("Generate Plot"):
         if "extracted_data" not in st.session_state:
             st.error("❌ No TDT data loaded. Please use the Data Extractor tab.")
@@ -445,111 +569,278 @@ with tab2:
             code12_times = [e["timestamp_s"] for e in data["events"] if e["code"] == 12]
             offset = pct_onset - code12_times[graph_code12_idx]
         except:
-            #add logic when skipping the pct line up
             offset=cutoff_time
 
-        fig = go.Figure()
+        # Load per-channel splices
+        _block_path = st.session_state.tdt_settings.get("block_folder", "")
+        raw_splices_ch1, raw_splices_ch2 = [], []
+        if _block_path and os.path.isdir(_block_path):
+            raw_splices_ch1 = load_splices(_block_path, channel=1)
+            raw_splices_ch2 = load_splices(_block_path, channel=2)
+        display_splices_ch1 = offset_splices(raw_splices_ch1, offset)
+        display_splices_ch2 = offset_splices(raw_splices_ch2, offset)
 
-        def process_trace(signal, control, color, label_prefix):
-            signal_ds = np.array([np.mean(signal[i:i+downsample_factor]) for i in range(0, len(signal), downsample_factor)])
-            control_ds = np.array([np.mean(control[i:i+downsample_factor]) for i in range(0, len(control), downsample_factor)])
+        # --- Compute traces and store in session_state ---
+        trace_results = {}  # label -> {time, dF, dF_z}
+
+        def compute_trace(signal, control, label_prefix, ch_display_splices):
+            # Pre-downsample length clamp (YARA indexing fix)
+            min_len = min(len(signal), len(control))
+            signal = signal[:min_len]
+            control = control[:min_len]
+
+            signal_ds = np.array([np.mean(signal[i_:i_+downsample_factor]) for i_ in range(0, len(signal), downsample_factor)])
+            control_ds = np.array([np.mean(control[i_:i_+downsample_factor]) for i_ in range(0, len(control), downsample_factor)])
             time = np.arange(len(signal_ds)) / data["fs"] * downsample_factor
 
             time -= offset
             valid = time >= 0
+            # 4-way guard to prevent index mismatch (YARA indexing fix)
+            min_len_ds = min(len(signal_ds), len(control_ds), len(time), len(valid))
+            signal_ds = signal_ds[:min_len_ds]
+            control_ds = control_ds[:min_len_ds]
+            time = time[:min_len_ds]
+            valid = valid[:min_len_ds]
+
             time = time[valid]
             signal_ds = signal_ds[valid]
             control_ds = control_ds[valid]
 
-            min_len = min(len(signal), len(control))
-            if len(signal) != len(control):
-                signal = signal[:min_len]
-                control = control[:min_len]
+            min_len_ds = min(len(signal_ds), len(control_ds))
+            signal_ds = signal_ds[:min_len_ds]
+            control_ds = control_ds[:min_len_ds]
+            time = time[:min_len_ds]
 
+            # Use splice mask to exclude spliced samples from polyfit
+            if ch_display_splices:
+                ds_fs = data["fs"] / downsample_factor
+                smask = get_splice_mask(len(signal_ds), ds_fs, ch_display_splices)
+                fit = np.polyfit(control_ds[smask], signal_ds[smask], 1)
+            else:
+                fit = np.polyfit(control_ds, signal_ds, 1)
 
-            fit = np.polyfit(control_ds,signal_ds, 1)
             fitted = fit[0] * control_ds + fit[1]
             dF = 100 * ((signal_ds - fitted) / fitted)
             dF_z = (dF - np.mean(dF)) / np.std(dF)
 
-            if label_prefix == "channel 2":
-                dF = dF + 3
+            trace_results[label_prefix] = {
+                "time": time, "dF": dF, "dF_z": dF_z
+            }
 
-            fig.add_trace(go.Scatter(
-                x=time,
-                y=dF if plot_choice == "ΔF/F" else dF_z,
-                mode='lines',
-                name=f"{label_prefix} {plot_choice}",
+        compute_trace(data["signal1"], data["control1"], "Channel 1", display_splices_ch1)
+        if show_second_channel and data.get("signal2") is not None:
+            compute_trace(data["signal2"], data["control2"], "Channel 2", display_splices_ch2)
+
+        # Store computed data for persistent display and export
+        st.session_state["tab2_traces"] = trace_results
+        st.session_state["tab2_display_splices_ch1"] = display_splices_ch1
+        st.session_state["tab2_display_splices_ch2"] = display_splices_ch2
+        st.session_state["tab2_offset"] = offset
+        st.session_state["tab2_plot_choice"] = plot_choice
+        st.session_state["tab2_enabled_events"] = dict(enabled_events)
+        st.session_state["tab2_code_colors"] = dict(code_colors) if enabled_events else {}
+        st.success("✅ Plot generated. Scroll down to view.")
+
+    # --- Render persisted plots (survives splice edits without re-generating) ---
+    if "tab2_traces" in st.session_state:
+        trace_results = st.session_state["tab2_traces"]
+        _plot_choice = st.session_state.get("tab2_plot_choice", "ΔF/F")
+        _enabled_events = st.session_state.get("tab2_enabled_events", {})
+        _code_colors = st.session_state.get("tab2_code_colors", {})
+
+        # Reload current splice state per channel from file (always up-to-date)
+        _bp = st.session_state.tdt_settings.get("block_folder", "")
+        _off = st.session_state.get("tab2_offset", 0)
+        _ch_splices = {}  # label -> display splices
+        if _bp and os.path.isdir(_bp):
+            _ch_splices["Channel 1"] = offset_splices(load_splices(_bp, channel=1), _off)
+            _ch_splices["Channel 2"] = offset_splices(load_splices(_bp, channel=2), _off)
+        else:
+            _ch_splices["Channel 1"] = st.session_state.get("tab2_display_splices_ch1", [])
+            _ch_splices["Channel 2"] = st.session_state.get("tab2_display_splices_ch2", [])
+
+        # ========== GRAPH 1: Full trace with splice overlay ==========
+        st.subheader("📈 Full Trace (with splice regions highlighted)")
+        fig1 = go.Figure()
+        for label, td in trace_results.items():
+            y_data = td["dF"] if _plot_choice == "ΔF/F" else td["dF_z"]
+            color = "blue" if "1" in label else "green"
+            if label == "Channel 2":
+                y_data = y_data + 3  # offset channel 2
+            fig1.add_trace(go.Scatter(
+                x=td["time"], y=y_data,
+                mode='lines', name=f"{label} {_plot_choice}",
                 line=dict(color=color),
-                legendgrouptitle=dict(font=dict(color='black'))
             ))
 
-        process_trace(data["signal1"], data["control1"], "blue", "Channel 1")
+        # Per-channel splice overlays
+        _splice_colors = {"Channel 1": "red", "Channel 2": "orange"}
+        for ch_label in trace_results.keys():
+            for s_start, s_end in _ch_splices.get(ch_label, []):
+                fig1.add_vrect(
+                    x0=s_start, x1=s_end,
+                    fillcolor=_splice_colors.get(ch_label, "red"), opacity=0.2,
+                    layer="below", line_width=1,
+                    line_color=_splice_colors.get(ch_label, "red"),
+                    annotation_text=f"splice ({ch_label})",
+                    annotation_position="top left",
+                    annotation_font_size=8,
+                    annotation_font_color=_splice_colors.get(ch_label, "red"),
+                )
 
-        if show_second_channel:
-            process_trace(data["signal2"], data["control2"], "green", "Channel 2")
+        # Event overlays
+        if "extracted_data" in st.session_state and _enabled_events:
+            events_to_plot = [
+                e for e in st.session_state.extracted_data.get("events", [])
+                if e.get("code") in _enabled_events and _enabled_events[e["code"]]
+            ]
+            grouped_events = {}
+            for event in events_to_plot:
+                code = event["code"]
+                grouped_events.setdefault(code, []).append(event["timestamp_s"])
 
-        fig.update_layout(
-            title=dict(text="Fiber Photometry with Behavioral Events", font=dict(color='black')),
+            ymins, ymaxs = [], []
+            for trace in fig1.data:
+                ymins.append(float(np.min(trace.y)))
+                ymaxs.append(float(np.max(trace.y)))
+            ymin = min(ymins) if ymins else -1
+            ymax = max(ymaxs) if ymaxs else 1
+
+            for code, times in grouped_events.items():
+                label = st.session_state.code_map.get(code, f"Code {code}")
+                color = _code_colors.get(code, "black")
+                x_vals, y_vals = [], []
+                for t in times:
+                    x_vals.extend([t, t, None])
+                    y_vals.extend([ymin, ymax, None])
+                fig1.add_trace(go.Scatter(
+                    x=x_vals, y=y_vals, mode="lines",
+                    line=dict(color=color, width=1, dash="dash"),
+                    name=label, hoverinfo="skip",
+                ))
+
+        fig1.update_layout(
+            title=dict(text="Fiber Photometry — Full Trace with Splice Regions", font=dict(color='black')),
             template="plotly_white",
-            xaxis=dict(
-                title=dict(text="Time (s)", font=dict(color='black')),
-                color='black',
-                tickfont=dict(color='black'),
-                rangeslider=dict(visible=True)
-            ),
-            yaxis=dict(
-                title=dict(text="ΔF/F (%)" if plot_choice == "ΔF/F" else "Z-scored ΔF/F", font=dict(color='black')),
-                color='black',
-                tickfont=dict(color='black'),
-            ),
-            font=dict(color="black"),
-            plot_bgcolor='white',
-            paper_bgcolor='white',
-            hovermode='closest',
-            height=500,
-            legend=dict(font=dict(color="black"))
+            xaxis=dict(title=dict(text="Time (s)", font=dict(color='black')),
+                       color='black', tickfont=dict(color='black'),
+                       rangeslider=dict(visible=True)),
+            yaxis=dict(title=dict(text="ΔF/F (%)" if _plot_choice == "ΔF/F" else "Z-scored ΔF/F",
+                                  font=dict(color='black')),
+                       color='black', tickfont=dict(color='black')),
+            font=dict(color="black"), plot_bgcolor='white',
+            paper_bgcolor='white', hovermode='closest',
+            height=500, legend=dict(font=dict(color="black")),
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+
+        # ========== GRAPH 2: Spliced trace (samples removed) ==========
+        st.subheader("📉 Spliced Trace (splice regions removed)")
+        fig2 = go.Figure()
+        for label, td in trace_results.items():
+            time_arr = td["time"]
+            dF_arr = td["dF"]
+            dF_z_arr = td["dF_z"]
+            # Build keep mask from this channel's splices
+            _this_ch_splices = _ch_splices.get(label, [])
+            if _this_ch_splices:
+                ds_fs_out = 1.0 / np.median(np.diff(time_arr)) if len(time_arr) > 1 else 1.0
+                keep = get_splice_mask(len(time_arr), ds_fs_out, _this_ch_splices)
+            else:
+                keep = np.ones(len(time_arr), dtype=bool)
+
+            time_clean = time_arr[keep]
+            dF_clean = dF_arr[keep]
+            dF_z_clean = dF_z_arr[keep]
+
+            y_data = dF_clean if _plot_choice == "ΔF/F" else dF_z_clean
+            color = "blue" if "1" in label else "green"
+            if label == "Channel 2":
+                y_data = y_data + 3
+            fig2.add_trace(go.Scatter(
+                x=time_clean, y=y_data,
+                mode='lines', name=f"{label} {_plot_choice} (spliced)",
+                line=dict(color=color),
+            ))
+
+        fig2.update_layout(
+            title=dict(text="Fiber Photometry — Spliced Trace", font=dict(color='black')),
+            template="plotly_white",
+            xaxis=dict(title=dict(text="Time (s)", font=dict(color='black')),
+                       color='black', tickfont=dict(color='black'),
+                       rangeslider=dict(visible=True)),
+            yaxis=dict(title=dict(text="ΔF/F (%)" if _plot_choice == "ΔF/F" else "Z-scored ΔF/F",
+                                  font=dict(color='black')),
+                       color='black', tickfont=dict(color='black')),
+            font=dict(color="black"), plot_bgcolor='white',
+            paper_bgcolor='white', hovermode='closest',
+            height=500, legend=dict(font=dict(color="black")),
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+        # ========== DATA EXPORT ==========
+        st.subheader("📥 Export Trace Data")
+        st.caption(
+            "Export the full trace with spliced regions removed. "
+            "Includes time, ΔF/F, and Z-scored ΔF/F for each channel."
         )
 
-        # --- Overlay Events (Optimized) ---
-        events_to_plot = [
-            e for e in st.session_state.extracted_data.get("events", [])
-            if e.get("code") in enabled_events and enabled_events[e["code"]]
-        ]
+        for label, td in trace_results.items():
+            time_arr = td["time"]
+            dF_arr = td["dF"]
+            dF_z_arr = td["dF_z"]
 
-        # Group events by code
-        grouped_events = {}
-        for event in events_to_plot:
-            code = event["code"]
-            grouped_events.setdefault(code, []).append(event["timestamp_s"])
+            # Apply this channel's splices
+            _this_ch_splices = _ch_splices.get(label, [])
+            if _this_ch_splices:
+                ds_fs_out = 1.0 / np.median(np.diff(time_arr)) if len(time_arr) > 1 else 1.0
+                keep = get_splice_mask(len(time_arr), ds_fs_out, _this_ch_splices)
+            else:
+                keep = np.ones(len(time_arr), dtype=bool)
 
-        # Get y-limits from data traces
-        ymins, ymaxs = [], []
-        for trace in fig.data:
-            ymins.append(np.min(trace.y))
-            ymaxs.append(np.max(trace.y))
-        ymin = float(np.min(ymins)) if ymins else -1
-        ymax = float(np.max(ymaxs)) if ymaxs else 1
+            time_export = time_arr[keep]
+            dF_export = dF_arr[keep]
+            dF_z_export = dF_z_arr[keep]
 
-        # Add one trace per event code (fast)
-        for code, times in grouped_events.items():
-            label = st.session_state.code_map.get(code, f"Code {code}")
-            color = code_colors.get(code, "black")
+            safe_label = label.replace(" ", "_")
 
-            x_vals, y_vals = [], []
-            for t in times:
-                x_vals.extend([t, t, None])
-                y_vals.extend([ymin, ymax, None])
+            # CSV export
+            export_df = pd.DataFrame({
+                "time_s": time_export,
+                "dF_F_pct": dF_export,
+                "dF_F_zscore": dF_z_export,
+            })
+            csv_buf = io.BytesIO()
+            export_df.to_csv(csv_buf, index=False)
+            csv_buf.seek(0)
 
-            fig.add_trace(go.Scatter(
-                x=x_vals, y=y_vals,
-                mode="lines",
-                line=dict(color=color, width=1, dash="dash"),
-                name=label,
-                hoverinfo="skip"
-            ))
+            # Numpy export (structured array)
+            npy_buf = io.BytesIO()
+            np.savez_compressed(
+                npy_buf,
+                time_s=time_export,
+                dF_F_pct=dF_export,
+                dF_F_zscore=dF_z_export,
+            )
+            npy_buf.seek(0)
 
-        st.plotly_chart(fig, width='stretch')
+            col_csv, col_npy = st.columns(2)
+            with col_csv:
+                st.download_button(
+                    label=f"📄 Download {label} CSV",
+                    data=csv_buf,
+                    file_name=f"{safe_label}_trace_spliced.csv",
+                    mime="text/csv",
+                    key=f"dl_csv_{safe_label}",
+                )
+            with col_npy:
+                st.download_button(
+                    label=f"💾 Download {label} NumPy (.npz)",
+                    data=npy_buf,
+                    file_name=f"{safe_label}_trace_spliced.npz",
+                    mime="application/octet-stream",
+                    key=f"dl_npy_{safe_label}",
+                )
 
 with tab4:
     st.title("📊 Multi-Block Fiber Photometry Analyzer")
