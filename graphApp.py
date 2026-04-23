@@ -567,12 +567,24 @@ with tab2:
         trace_results = {}  # label -> {time, dF, dF_z}
 
         def compute_trace(signal, control, label_prefix, ch_display_splices):
+            # Pre-downsample length clamp (YARA indexing fix)
+            min_len = min(len(signal), len(control))
+            signal = signal[:min_len]
+            control = control[:min_len]
+
             signal_ds = np.array([np.mean(signal[i_:i_+downsample_factor]) for i_ in range(0, len(signal), downsample_factor)])
             control_ds = np.array([np.mean(control[i_:i_+downsample_factor]) for i_ in range(0, len(control), downsample_factor)])
             time = np.arange(len(signal_ds)) / data["fs"] * downsample_factor
 
             time -= offset
             valid = time >= 0
+            # 4-way guard to prevent index mismatch (YARA indexing fix)
+            min_len_ds = min(len(signal_ds), len(control_ds), len(time), len(valid))
+            signal_ds = signal_ds[:min_len_ds]
+            control_ds = control_ds[:min_len_ds]
+            time = time[:min_len_ds]
+            valid = valid[:min_len_ds]
+
             time = time[valid]
             signal_ds = signal_ds[valid]
             control_ds = control_ds[valid]
