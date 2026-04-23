@@ -70,7 +70,8 @@ def run_batch_processing(
     find_stream_by_substr=find_stream_by_substr,
     load_tdt_block=load_tdt_block,
     verbose=True,
-    code12_index=1
+    code12_index=1,
+    pct_onset_index=1
 ):
     timestamp_str = dt.now().strftime("%Y%m%d_%H%M%S")
     event_folder = os.path.join(base_path, "plots", f"{_safe_name(selected_event)}_{timestamp_str}")
@@ -220,10 +221,10 @@ def run_batch_processing(
                         except Exception:
                             pass
                         code12_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 12]
-                        required_count = code12_index + 1
-                        if onset_list is not None and len(onset_list) >= required_count and len(code12_times) >= required_count:
-                            pct_onset = float(onset_list[code12_index])
-                            offset = pct_onset - code12_times[code12_index]
+                        required_pct = pct_onset_index + 1
+                        if onset_list is not None and len(onset_list) >= required_pct and len(code12_times) >= 2:
+                            pct_onset = float(onset_list[pct_onset_index])
+                            offset = pct_onset - code12_times[1]
                             time_full = np.arange(len(sig)) / fs_orig
                             time_full -= offset
                             valid = time_full >= 0
@@ -231,10 +232,10 @@ def run_batch_processing(
                             ctrl = ctrl[valid]
                             event_times = [t - offset for t in event_times]
                             if verbose:
-                                print(f"Alignment applied using code12 index {code12_index}. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
+                                print(f"Alignment applied using PCT onset index {pct_onset_index}, code12 index 1. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
                         else:
                             if verbose:
-                                print(f"Alignment conditions not met (need {required_count} onset(s)/code12(s)); skipping alignment", flush=True)
+                                print(f"Alignment conditions not met (need {required_pct} PCT onset(s) and 2 code12(s)); skipping alignment", flush=True)
                 except Exception as e:
                     print("WARNING: alignment failed:", e, flush=True)
 
