@@ -451,26 +451,21 @@ with tab2:
         fig = go.Figure()
 
         def process_trace(signal, control, color, label_prefix):
-            
-            min_len = min(len(signal), len(control))
-            signal = signal[:min_len]
-            control = control[:min_len]
-            # Downsample
             signal_ds = np.array([np.mean(signal[i:i+downsample_factor]) for i in range(0, len(signal), downsample_factor)])
             control_ds = np.array([np.mean(control[i:i+downsample_factor]) for i in range(0, len(control), downsample_factor)])
             time = np.arange(len(signal_ds)) / data["fs"] * downsample_factor
 
             time -= offset
             valid = time >= 0
-            min_len = min(len(signal_ds), len(control_ds), len(time), len(valid))
-            signal_ds = signal_ds[:min_len]
-            control_ds = control_ds[:min_len]
-            time = time[:min_len]
-            valid = valid[:min_len]
-            
             time = time[valid]
             signal_ds = signal_ds[valid]
             control_ds = control_ds[valid]
+
+            min_len = min(len(signal), len(control))
+            if len(signal) != len(control):
+                signal = signal[:min_len]
+                control = control[:min_len]
+
 
             fit = np.polyfit(control_ds,signal_ds, 1)
             fitted = fit[0] * control_ds + fit[1]
