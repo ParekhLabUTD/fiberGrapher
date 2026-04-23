@@ -12,6 +12,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from splice_utils import load_splices, get_splice_mask, check_snippet_overlaps_splice, offset_splices
+
 # helper safe name
 def _safe_name(s: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s))
@@ -207,6 +209,7 @@ def run_batch_processing(
                     print(f"Signal len={len(sig)}, Control len={len(ctrl)}, Fs_orig={fs_orig}", flush=True)
 
                 event_times = [e['timestamp_s'] for e in meta.get("events", []) if e.get("event") == selected_event]
+                offset = 0.0  # default; overwritten if PCT alignment succeeds
                 try:
                     if meta.get('interpretor', 1) == 2:
                         pct_name = 'PtC1' if meta.get('signalChannelSet',1) == 1 else 'PtC2'
@@ -239,6 +242,14 @@ def run_batch_processing(
                     summary["errors"].append({"session": s_path, "error": warn})
                     continue
 
+                # --- Load and adjust splices for this block ---
+                block_splices_raw = load_splices(s_path)
+                block_splices = offset_splices(block_splices_raw, offset) if block_splices_raw else []
+                if verbose and block_splices:
+                    print(f"Loaded {len(block_splices)} splice region(s) for this block", flush=True)
+                    for _ss, _se in block_splices:
+                        print(f"  Splice: {_ss:.2f}s - {_se:.2f}s (aligned coords)", flush=True)
+
                 ds = int(downsample_factor)
                 if ds > 1:
                     sig = sig[::ds]
@@ -259,7 +270,12 @@ def run_batch_processing(
                     ctrl = ctrl[:min_len]
 
                 try:
-                    p = np.polyfit(ctrl, sig, 1)
+                    # Exclude spliced regions from polyfit regression
+                    if block_splices:
+                        splice_mask = get_splice_mask(min_len, fs, block_splices)
+                        p = np.polyfit(ctrl[splice_mask], sig[splice_mask], 1)
+                    else:
+                        p = np.polyfit(ctrl, sig, 1)
                     fitted = p[0] * ctrl + p[1]
                     dff = 100.0 * (sig - fitted) / (fitted + 1e-12)
                 except Exception as e:
@@ -300,6 +316,14 @@ def run_batch_processing(
                     if start_idx < 0 or end_idx > len(dff):
                         if verbose:
                             print(f"  Skip trial {trial_index}: start={start_idx} end={end_idx} out of bounds (len={len(dff)})", flush=True)
+                        summary["invalid_trials"] += 1
+                        summary["n_trials_total"] += 1
+                        continue
+
+                    # Skip trials whose peri-event window overlaps a spliced region
+                    if block_splices and check_snippet_overlaps_splice(ts, pre_t, post_t, block_splices):
+                        if verbose:
+                            print(f"  Skip trial {trial_index}: peri-event window overlaps splice region", flush=True)
                         summary["invalid_trials"] += 1
                         summary["n_trials_total"] += 1
                         continue
