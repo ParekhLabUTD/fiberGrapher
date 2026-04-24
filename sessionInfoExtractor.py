@@ -82,6 +82,7 @@ def add_events_to_sessions(metadata):
         else:
             data_temp = readfile(data['event_file_path'])
             code_map = {
+                0: "session_end",
                 1: "event 1",
                 2: "event 2",
                 3: "event 3",

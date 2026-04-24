@@ -1,7 +1,7 @@
 # Full Data Audit — Every Step the Data Goes Through
 
 > [!NOTE]
-> Last updated: 2026-04-23. Reflects per-channel signal splicing across all tabs.
+> Last updated: 2026-04-24. Reflects code 0 cutoff, per-channel splicing, per-session PCT, block-averaging downsample across all tabs.
 
 ---
 
@@ -27,6 +27,32 @@ graph LR
 
 ---
 
+## Code 0 Cutoff (NEW)
+
+When enabled, the first event with `code == 0` is found and all signal/control data **after** that timestamp is truncated. In batch processing, events after code 0 are also filtered out.
+
+**Order of operations**: Applied AFTER PCT alignment but BEFORE splice masking and downsampling.
+
+---
+
+## Downsample Method (UPDATED)
+
+All tabs now use **block-averaging** (Lerner et al. 2015):
+
+```python
+signal_ds[i] = mean(signal[i*N : i*N + N])
+```
+
+Previously Tab 3 and Tab 4 used decimation (`signal[::N]`). Now consistent across all pipelines.
+
+---
+
+## Per-Session PCT (NEW)
+
+Tab 4 now allows per-session PCT onset index selection. Stored in a separate `epoch_choices.json` file (not in `group_assignments.json`). Each session can independently use 1st or 2nd PCT onset.
+
+---
+
 ## Pipeline 1: Tab 2 — Graph Viewer (`graphApp.py` `compute_trace`)
 
 ### Step-by-step data flow
@@ -38,18 +64,21 @@ graph TD
     A --> A3["fs = extracted_data.fs"]
     A1 --> B["Pre-downsample clamp: min_len = min(len sig, len ctrl)"]
     A2 --> B
-    B --> C["Downsample by averaging blocks of N samples:<br/>signal_ds[i] = mean(signal[i*N : (i+1)*N])<br/>control_ds[i] = mean(control[i*N : (i+1)*N])"]
+    B --> C["Block-averaging downsample (Lerner 2015):<br/>signal_ds[i] = mean(signal[i*N : i*N+N])<br/>control_ds[i] = mean(control[i*N : i*N+N])"]
     C --> D["time = arange(len signal_ds) / fs * N"]
     D --> E["PCT alignment: time -= offset<br/>Keep only time ≥ 0 (trim start)"]
     E --> F["Truncate signal_ds, control_ds, time to equal length"]
+    F --> F2{"Code 0 cutoff enabled?"}
+    F2 -->|yes| F3["Truncate all arrays where time <= code0_timestamp"]
+    F2 -->|no| G
+    F3 --> G{"Channel has splices?"}
 ```
 
 ### Regression + ΔF/F + Z-score
 
 ```mermaid
 graph TD
-    F["Aligned, downsampled arrays"] --> G{"Channel has splices?"}
-    G -->|yes| H["smask = get_splice_mask(len, ds_fs, display_splices)<br/>ds_fs = fs / downsample_factor"]
+    G{"Channel has splices?"} -->|yes| H["smask = get_splice_mask(len, ds_fs, display_splices)"]
     G -->|no| I["Use all samples"]
     H --> J["p = polyfit(control_ds[smask], signal_ds[smask], 1)"]
     I --> J2["p = polyfit(control_ds, signal_ds, 1)"]
@@ -84,15 +113,16 @@ graph LR
     C --> D["Plot cleaned trace"]
 ```
 
-### Exports (CSV / NPZ)
+### Exports (CSV / NPZ / NPY)
 
 Same masking as Graph 2. Each channel uses its own splice definitions.
 
-| Column | Content |
+| Format | Content |
 |---|---|
-| `time_s` | Timepoints with spliced samples removed |
-| `dF_F_pct` | ΔF/F (%) at each kept timepoint |
-| `dF_F_zscore` | Z-scored ΔF/F at each kept timepoint |
+| CSV | `time_s`, `dF_F_pct`, `dF_F_zscore` |
+| NPZ | Compressed: `time_s`, `dF_F_pct`, `dF_F_zscore` |
+| dF/F .npy | 1-D array: `dF_F_pct` only |
+| Z-dF/F .npy | 1-D array: `dF_F_zscore` only |
 
 ---
 
@@ -106,10 +136,13 @@ graph TD
     A --> B{"PCT alignment enabled?"}
     B -->|yes| C["offset = pct_onset − code12_times[1]<br/>Trim signal/control where time < 0"]
     B -->|no| C2["No trimming"]
-    C --> D["Downsample: signal[::ds], control[::ds], fs /= ds"]
+    C --> D["Block-averaging downsample (Lerner 2015)"]
     C2 --> D
     D --> E["Truncate to min(len signal, len control)"]
-    E --> F["Load splices: load_splices(block, channel=signal_set)<br/>Adjust: offset_splices(raw, pct_offset)"]
+    E --> E2{"Code 0 cutoff enabled?"}
+    E2 -->|yes| E3["Truncate signal/control where time <= code0_t"]
+    E2 -->|no| F
+    E3 --> F["Load splices: load_splices(block, channel=signal_set)<br/>Adjust: offset_splices(raw, pct_offset)"]
     F --> G{"Has splices?"}
     G -->|yes| H["mask = get_splice_mask(min_len, fs, splices)<br/>fit = polyfit(control[mask], signal[mask], 1)"]
     G -->|no| I["fit = polyfit(control, signal, 1)"]
@@ -161,13 +194,17 @@ graph TD
     A["TDT Block (raw)"] --> B["scs = meta.signalChannelSet (1 or 2)"]
     B --> C["scs=1: sig=_465A, ctrl=_415A<br/>scs=2: sig=_465C, ctrl=_415C"]
     C --> D["Read streams: sig, ctrl, fs_orig"]
-    D --> E{"interpretor == 2?<br/>(PCT alignment)"}
+    D --> D2["Determine per-session PCT onset index<br/>(from pct_onset_map or global fallback)"]
+    D2 --> E{"interpretor == 2?<br/>(PCT alignment)"}
     E -->|yes| F["offset = pct_onset − code12_times[1]<br/>Trim signal/control where time < 0<br/>Shift event_times by −offset"]
     E -->|no| F2["offset = 0.0"]
-    F --> G["Load splices: load_splices(block_path, channel=scs)"]
-    F2 --> G
+    F --> F3{"Code 0 cutoff enabled?"}
+    F2 --> F3
+    F3 -->|yes| F4["Truncate sig/ctrl at code 0 timestamp<br/>Filter event_times <= code0_t"]
+    F3 -->|no| G
+    F4 --> G["Load splices: load_splices(block_path, channel=scs)"]
     G --> H["block_splices = offset_splices(raw_splices, offset)"]
-    H --> I["Downsample: sig[::ds], ctrl[::ds], fs = fs_orig / ds"]
+    H --> I["Block-averaging downsample (Lerner 2015)"]
     I --> J["Truncate to min(len sig, len ctrl)"]
     J --> K{"Has splices?"}
     K -->|yes| L["splice_mask = get_splice_mask(min_len, fs, block_splices)<br/>p = polyfit(ctrl[splice_mask], sig[splice_mask], 1)"]
@@ -317,6 +354,16 @@ Pivot trial data → matrix (rows=trials, cols=timepoints). Color limits: `±per
 
 ---
 
+## Persistent Configuration Files
+
+| File | Location | Contents |
+|---|---|---|
+| `group_assignments.json` | Parent data directory | Group → Mouse → Session path assignments |
+| `epoch_choices.json` | Parent data directory | Per-session PCT onset index (`mouse|path` → 0 or 1) |
+| `splices_ch{N}.txt` | Each TDT block folder | Splice regions (start,end in raw seconds) |
+
+---
+
 ## Known Design Decisions
 
 | Item | Behavior |
@@ -326,3 +373,6 @@ Pivot trial data → matrix (rows=trials, cols=timepoints). Color limits: `±per
 | Splice masking vs deletion | Polyfit excludes spliced samples; ΔF/F computed for all; spliced samples removed post-hoc for graphs/exports |
 | ΔF/F denominator | Batch uses `fitted + 1e-12`; Tabs 2/3 use `fitted` directly |
 | AUC method | Batch: `trapz(y, dx=1/fs)`; Advanced: `trapz(y, x)` |
+| Downsample method | Block-averaging across all tabs (Lerner et al. 2015) |
+| Code 0 cutoff order | After PCT alignment, before splice masking and downsampling |
+| Per-session PCT | Stored in `epoch_choices.json`, falls back to global setting if not specified |

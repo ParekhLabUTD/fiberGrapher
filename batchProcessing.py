@@ -71,7 +71,9 @@ def run_batch_processing(
     load_tdt_block=load_tdt_block,
     verbose=True,
     code12_index=1,
-    pct_onset_index=1
+    pct_onset_index=1,
+    pct_onset_map=None,
+    code0_cutoff=False
 ):
     timestamp_str = dt.now().strftime("%Y%m%d_%H%M%S")
     event_folder = os.path.join(base_path, "plots", f"{_safe_name(selected_event)}_{timestamp_str}")
@@ -212,6 +214,18 @@ def run_batch_processing(
 
                 event_times = [e['timestamp_s'] for e in meta.get("events", []) if e.get("event") == selected_event]
                 offset = 0.0  # default; overwritten if PCT alignment succeeds
+
+                # Determine PCT onset index for this session (per-session map overrides global)
+                _session_pct_idx = pct_onset_index
+                if pct_onset_map:
+                    _pct_key = (s_path, mouse_id)
+                    if _pct_key in pct_onset_map:
+                        _session_pct_idx = pct_onset_map[_pct_key]
+                    elif norm_path in pct_onset_map:
+                        _session_pct_idx = pct_onset_map[norm_path]
+                if verbose:
+                    print(f"PCT onset index for this session: {_session_pct_idx}", flush=True)
+
                 try:
                     if meta.get('interpretor', 1) == 2:
                         pct_name = 'PtC1' if meta.get('signalChannelSet',1) == 1 else 'PtC2'
@@ -221,9 +235,9 @@ def run_batch_processing(
                         except Exception:
                             pass
                         code12_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 12]
-                        required_pct = pct_onset_index + 1
+                        required_pct = _session_pct_idx + 1
                         if onset_list is not None and len(onset_list) >= required_pct and len(code12_times) >= 2:
-                            pct_onset = float(onset_list[pct_onset_index])
+                            pct_onset = float(onset_list[_session_pct_idx])
                             offset = pct_onset - code12_times[1]
                             time_full = np.arange(len(sig)) / fs_orig
                             time_full -= offset
@@ -232,12 +246,25 @@ def run_batch_processing(
                             ctrl = ctrl[valid]
                             event_times = [t - offset for t in event_times]
                             if verbose:
-                                print(f"Alignment applied using PCT onset index {pct_onset_index}, code12 index 1. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
+                                print(f"Alignment applied using PCT onset index {_session_pct_idx}, code12 index 1. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
                         else:
                             if verbose:
                                 print(f"Alignment conditions not met (need {required_pct} PCT onset(s) and 2 code12(s)); skipping alignment", flush=True)
                 except Exception as e:
                     print("WARNING: alignment failed:", e, flush=True)
+
+                # --- Code 0 cutoff: truncate signal/control after code 0 timestamp ---
+                if code0_cutoff:
+                    _code0_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 0]
+                    if _code0_times:
+                        _code0_t = _code0_times[0]
+                        _time_arr = np.arange(len(sig)) / fs_orig
+                        _code0_keep = _time_arr <= _code0_t
+                        sig = sig[_code0_keep]
+                        ctrl = ctrl[_code0_keep]
+                        event_times = [t for t in event_times if t <= _code0_t]
+                        if verbose:
+                            print(f"Code 0 cutoff at {_code0_t:.2f}s -> {len(sig)} samples remain", flush=True)
 
                 if len(event_times) == 0:
                     warn = f"no '{selected_event}' events in session {s_path}"
@@ -255,8 +282,9 @@ def run_batch_processing(
 
                 ds = int(downsample_factor)
                 if ds > 1:
-                    sig = sig[::ds]
-                    ctrl = ctrl[::ds]
+                    # Block-averaging downsample (Lerner et al. 2015)
+                    sig = np.array([np.mean(sig[i_:i_+ds]) for i_ in range(0, len(sig), ds)])
+                    ctrl = np.array([np.mean(ctrl[i_:i_+ds]) for i_ in range(0, len(ctrl), ds)])
                     fs = fs_orig / ds
                 else:
                     fs = fs_orig

@@ -1,6 +1,7 @@
 import csv
 
 code_map = {
+    0: 'session_end',
     51: 'tone',
     31: 'lick',
     13: 'spout extended',

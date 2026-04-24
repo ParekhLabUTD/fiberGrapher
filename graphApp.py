@@ -165,16 +165,30 @@ with tab3:
                             st.info(f"Applied PCT alignment using {peri_pct_choice}, offset = {offset:.3f} s")
                 except Exception as e:
                     st.warning(f"Alignment failed: {e}")
-            # Downsample
+            # Downsample (block-averaging, Lerner et al. 2015)
             if downsample_factor > 1:
-                signal = signal[::downsample_factor]
-                control = control[::downsample_factor]
+                signal = np.array([np.mean(signal[i_:i_+downsample_factor]) for i_ in range(0, len(signal), downsample_factor)])
+                control = np.array([np.mean(control[i_:i_+downsample_factor]) for i_ in range(0, len(control), downsample_factor)])
                 fs = fs / downsample_factor
 
             min_len = min(len(signal), len(control))
             if len(signal) != len(control):
                 signal = signal[:min_len]
                 control = control[:min_len]
+
+            # --- Code 0 cutoff ---
+            peri_code0_cutoff = st.checkbox("Cut off signal at Code 0 (session end)?", value=False, key="peri_code0_cutoff")
+            if peri_code0_cutoff:
+                _t3_events = st.session_state.extracted_data.get("events", [])
+                _t3_code0_times = [e["timestamp_s"] for e in _t3_events if e.get("code") == 0]
+                if _t3_code0_times:
+                    _t3_code0_t = _t3_code0_times[0]
+                    _t3_time_arr = np.arange(len(signal)) / fs
+                    _t3_code0_keep = _t3_time_arr <= _t3_code0_t
+                    signal = signal[_t3_code0_keep]
+                    control = control[_t3_code0_keep]
+                    min_len = len(signal)
+                    st.info(f"Code 0 cutoff applied at {_t3_code0_t:.2f}s — {len(signal)} samples remain")
 
             # --- Load splices for regression masking ---
             _t3_block = st.session_state.tdt_settings.get("block_folder", "")
@@ -441,6 +455,9 @@ with tab2:
 
     plot_choice = st.radio("Plot Type", ["ΔF/F", "Z-scored ΔF/F"])
 
+    # --- Code 0 cutoff ---
+    code0_cutoff_enabled = st.checkbox("Cut off signal at Code 0 (session end)?", value=False, key="tab2_code0_cutoff")
+
     enabled_events = {}
 
     if "extracted_data" in st.session_state and "events" in st.session_state.extracted_data:
@@ -501,7 +518,7 @@ with tab2:
         if "extracted_data" in st.session_state:
             try:
                 _d = st.session_state.extracted_data
-                _splice_offset = _d["pct"][1] - [
+                _splice_offset = _d["pct"][graph_pct_idx] - [
                     e["timestamp_s"] for e in _d.get("events", []) if e.get("code") == 12
                 ][1]
             except Exception:
@@ -613,6 +630,16 @@ with tab2:
             signal_ds = signal_ds[:min_len_ds]
             control_ds = control_ds[:min_len_ds]
             time = time[:min_len_ds]
+
+            # --- Code 0 cutoff: truncate after code 0 timestamp ---
+            if code0_cutoff_enabled and "events" in data and data["events"]:
+                code0_times = [e["timestamp_s"] for e in data["events"] if e.get("code") == 0]
+                if code0_times:
+                    code0_t = code0_times[0]  # first code 0
+                    code0_keep = time <= code0_t
+                    time = time[code0_keep]
+                    signal_ds = signal_ds[code0_keep]
+                    control_ds = control_ds[code0_keep]
 
             # Use splice mask to exclude spliced samples from polyfit
             if ch_display_splices:
@@ -833,10 +860,19 @@ with tab2:
             )
             npy_buf.seek(0)
 
-            col_csv, col_npy = st.columns(2)
+            # Individual .npy exports (1-D arrays, no time)
+            npy_dff_buf = io.BytesIO()
+            np.save(npy_dff_buf, dF_export)
+            npy_dff_buf.seek(0)
+
+            npy_dff_z_buf = io.BytesIO()
+            np.save(npy_dff_z_buf, dF_z_export)
+            npy_dff_z_buf.seek(0)
+
+            col_csv, col_npy, col_dff_npy, col_dffz_npy = st.columns(4)
             with col_csv:
                 st.download_button(
-                    label=f"📄 Download {label} CSV",
+                    label=f"📄 {label} CSV",
                     data=csv_buf,
                     file_name=f"{safe_label}_trace_spliced.csv",
                     mime="text/csv",
@@ -844,11 +880,27 @@ with tab2:
                 )
             with col_npy:
                 st.download_button(
-                    label=f"💾 Download {label} NumPy (.npz)",
+                    label=f"💾 {label} NPZ",
                     data=npy_buf,
                     file_name=f"{safe_label}_trace_spliced.npz",
                     mime="application/octet-stream",
                     key=f"dl_npy_{safe_label}",
+                )
+            with col_dff_npy:
+                st.download_button(
+                    label=f"📊 {label} dF/F (.npy)",
+                    data=npy_dff_buf,
+                    file_name=f"{safe_label}_dFF.npy",
+                    mime="application/octet-stream",
+                    key=f"dl_dff_npy_{safe_label}",
+                )
+            with col_dffz_npy:
+                st.download_button(
+                    label=f"📊 {label} Z-dF/F (.npy)",
+                    data=npy_dff_z_buf,
+                    file_name=f"{safe_label}_dFF_zscore.npy",
+                    mime="application/octet-stream",
+                    key=f"dl_dffz_npy_{safe_label}",
                 )
 
 with tab4:
@@ -905,6 +957,15 @@ with tab4:
         elif "groups" not in st.session_state:
             st.session_state["groups"] = {}
 
+        # Auto-load per-session epoch choices
+        epoch_file = os.path.join(path, "epoch_choices.json")
+        if os.path.exists(epoch_file) and "epoch_choices" not in st.session_state:
+            with open(epoch_file, "r") as f:
+                st.session_state["epoch_choices"] = json.load(f)
+            st.info("Loaded existing epoch choices from disk.")
+        elif "epoch_choices" not in st.session_state:
+            st.session_state["epoch_choices"] = {}
+
         # Create a new group
         new_group = st.text_input("Create new group (e.g., Control, Lesion, Drug):")
         if st.button("➕ Add Group"):
@@ -959,6 +1020,22 @@ with tab4:
                 elif mouse in st.session_state["groups"][group_name]:
             # If user deselects all sessions, remove mouse entry
                     del st.session_state["groups"][group_name][mouse]
+
+                # --- Per-session PCT epoch choice ---
+                if selected_sessions:
+                    for s_path in selected_sessions:
+                        _ep_key = f"{mouse}|{s_path}"
+                        _ep_default = st.session_state.get("epoch_choices", {}).get(_ep_key, 1)
+                        _ep_choice = st.selectbox(
+                            f"PCT onset for {os.path.basename(s_path)}",
+                            ["1st PCT onset", "2nd PCT onset"],
+                            index=_ep_default,
+                            key=f"epoch_{group_name}_{mouse}_{os.path.basename(s_path)}"
+                        )
+                        _ep_val = 0 if _ep_choice == "1st PCT onset" else 1
+                        if "epoch_choices" not in st.session_state:
+                            st.session_state["epoch_choices"] = {}
+                        st.session_state["epoch_choices"][_ep_key] = _ep_val
                 
             st.markdown("---")
 
@@ -975,7 +1052,11 @@ with tab4:
                 save_path = os.path.join(path, "group_assignments.json")
                 with open(save_path, "w") as f:
                     json.dump(st.session_state["groups"], f, indent=2)
-                st.success(f"Saved to {save_path}")
+                # Also save epoch choices
+                epoch_save_path = os.path.join(path, "epoch_choices.json")
+                with open(epoch_save_path, "w") as f:
+                    json.dump(st.session_state.get("epoch_choices", {}), f, indent=2)
+                st.success(f"Saved groups to {save_path} and epoch choices to {epoch_save_path}")
 
     else:
         st.info("Enter a directory and click 'Load Metadata' to begin.")
@@ -1007,13 +1088,10 @@ with tab4:
         else:
             st.markdown("### Event & Processing Options")
             selected_event = st.selectbox("Select event (one):", event_names)
-            batch_pct_choice = st.selectbox(
-                "Which PCT epoch onset to use for alignment?",
-                ["1st PCT onset", "2nd PCT onset"],
-                index=1,
-                key="batch_pct_choice"
-            )
-            batch_pct_idx = 0 if batch_pct_choice == "1st PCT onset" else 1
+
+            # --- Code 0 cutoff ---
+            batch_code0_cutoff = st.checkbox("Cut off signal at Code 0 (session end)?", value=False, key="batch_code0_cutoff")
+
             pre_t = st.number_input("Peri-event PRE time (s)", min_value=0.0, value=5.0)
             post_t = st.number_input("Peri-event POST time (s)", min_value=0.0, value=10.0)
             baseline_lower = st.number_input("Baseline window start (s, relative to T0, negative)", value=-4.0)
@@ -1028,7 +1106,7 @@ with tab4:
                 # Output folder base (timestamped to avoid overwrite)
                 timestamp_str = dt.now().strftime("%Y%m%d_%H%M%S")
                 plots_base = os.path.join(path, "plots", f"{_safe_name(selected_event)}_{timestamp_str}")
-                os.makedirs(plots_base, exist_ok=True)
+                #os.makedirs(plots_base, exist_ok=True)
 
                 # Prepare containers for results
                 per_mouse_session_traces = defaultdict(list)   # mouse -> list of session avg traces (arrays)
@@ -1040,6 +1118,14 @@ with tab4:
                 if st.button("▶️ Run Averaging & Save Plots"):
                     with st.spinner("Running batch processing..."):
                         try:
+                            # Build per-session PCT onset map from epoch_choices
+                            _epoch_choices = st.session_state.get("epoch_choices", {})
+                            _pct_onset_map = {}
+                            for _ek, _ev in _epoch_choices.items():
+                                if "|" in _ek:
+                                    _mouse_id, _s_path = _ek.split("|", 1)
+                                    _pct_onset_map[(_s_path, _mouse_id)] = _ev
+
                             summary = run_batch_processing(
                                 base_path=path,
                                 selected_event=selected_event,
@@ -1052,7 +1138,9 @@ with tab4:
                                 find_stream_by_substr=find_stream_by_substr,
                                 load_tdt_block=load_tdt_block,
                                 verbose=True,
-                                pct_onset_index=batch_pct_idx,
+                                pct_onset_index=1,  # fallback; overridden per-session by pct_onset_map
+                                pct_onset_map=_pct_onset_map,
+                                code0_cutoff=batch_code0_cutoff,
                             )
                             st.success(f"Processing complete. Output folder: {summary['output_files']['event_folder']}")
                             st.write(summary)  # visible run summary in the UI
