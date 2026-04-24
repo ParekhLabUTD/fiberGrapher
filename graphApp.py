@@ -272,7 +272,7 @@ with tab3:
             else:
                 snippets = np.array(snippets)
                 mean_snip = np.mean(snippets, axis=0)
-                std_snip = np.std(snippets, axis=0)
+                sem_snip = np.std(snippets, axis=0) / np.sqrt(snippets.shape[0])
 
                 # peri-event time vector in seconds
                 peri_time = np.arange(TRANGE[0], TRANGE[1]) / fs
@@ -284,10 +284,10 @@ with tab3:
                 for snip in snippets:
                     ax.plot(peri_time, snip, linewidth=0.5, color='gray', alpha=0.5)
 
-                # Mean ± STD
+                # Mean ± SEM
                 ax.plot(peri_time, mean_snip, color='green', linewidth=2, label='Mean ΔF/F')
-                ax.fill_between(peri_time, mean_snip - std_snip, mean_snip + std_snip,
-                                color='green', alpha=0.2, label='±STD')
+                ax.fill_between(peri_time, mean_snip - sem_snip, mean_snip + sem_snip,
+                                color='green', alpha=0.2, label='±SEM')
 
                 # Event onset marker
                 ax.axvline(0, color='slategray', linestyle='--', linewidth=2, label=f'{event_name} Onset')
