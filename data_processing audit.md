@@ -1,7 +1,7 @@
 # Full Data Audit — Every Step the Data Goes Through
 
 > [!NOTE]
-> Last updated: 2026-04-24. Reflects code 0 cutoff, per-channel splicing, per-session PCT, block-averaging downsample across all tabs.
+> Last updated: 2026-05-26. Reflects code 0 cutoff, per-channel splicing, per-session PCT, block-averaging downsample across all tabs, and `math_utils.py` shared module refactor.
 
 ---
 
@@ -50,6 +50,32 @@ Previously Tab 3 and Tab 4 used decimation (`signal[::N]`). Now consistent acros
 ## Per-Session PCT (NEW)
 
 Tab 4 now allows per-session PCT onset index selection. Stored in a separate `epoch_choices.json` file (not in `group_assignments.json`). Each session can independently use 1st or 2nd PCT onset.
+
+---
+
+## Shared Math Module (`math_utils.py`)
+
+All repeated signal-processing math is centralized in `math_utils.py`. Both `graphApp.py` (Tabs 2/3) and `batchProcessing.py` (Tab 4) import from this module.
+
+| Function | Purpose | Used by |
+|---|---|---|
+| `downsample_block_average(signal, factor)` | Lerner et al. 2015 block-averaging | Tabs 2, 3, 4 |
+| `match_lengths(*arrays)` | Truncate arrays to shortest | Tabs 2, 3, 4 |
+| `compute_dff(signal, control, splice_mask, epsilon)` | Polyfit regression + ΔF/F | Tabs 2, 3, 4 |
+| `zscore_global(dff, splice_mask)` | Whole-trace z-score | Tab 2 |
+| `zscore_baseline(snippet, start, end)` | Per-event baseline z-score | Tab 3 (baseline mode) |
+| `zscore_baseline_with_fallback(...)` | Baseline z-score with cascade | Tab 4 |
+| `compute_sem(traces_array)` | SEM = std/√n | Tabs 2, 3, 4 |
+| `compute_pct_offset(pct_onset, code12_times, idx)` | PCT alignment offset | Tabs 2, 3, 4 |
+| `apply_pct_alignment(sig, ctrl, fs, offset)` | Trim to t≥0 after offset | Tabs 2, 3, 4 |
+| `apply_code0_cutoff(sig, ctrl, fs, code0_t)` | Truncate at code 0 | Tabs 3, 4 |
+| `apply_code0_cutoff_with_time(time, sig, ctrl, code0_t)` | Truncate with time array | Tab 2 |
+| `compute_peri_time_vector(pre, post, fs)` | Peri-event time axis | Tab 4 |
+| `extract_peri_snippet(dff, event, pre, post, fs)` | Extract snippet from trace | Tab 4 |
+| `compute_trial_metrics(snippet_z, fs, ...)` | Peak, AUC, latency | Tab 4 |
+
+> [!IMPORTANT]
+> The `epsilon` parameter in `compute_dff` preserves the existing difference: Tabs 2/3 use `epsilon=0.0`, Tab 4 uses `epsilon=1e-12`.
 
 ---
 

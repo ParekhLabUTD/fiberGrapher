@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import numpy as np
 import tempfile
 import os
@@ -16,13 +16,6 @@ from OHRBETsEventExtractor import parse_ohrbets_serial_log
 from nxtEventExtrator import readfile, get_events, get_event_codes
 from sessionInfoExtractor import *
 from splice_utils import load_splices, save_splices, get_splice_mask, check_snippet_overlaps_splice, offset_splices
-from math_utils import (
-    downsample_block_average, match_lengths, compute_dff,
-    zscore_global, zscore_baseline, compute_sem,
-    apply_pct_alignment as _apply_pct_alignment,
-    apply_code0_cutoff, apply_code0_cutoff_with_time,
-    compute_pct_offset,
-)
 from batchProcessing import run_batch_processing
 from advanced_graphing import (
     run_advanced_graphing, discover_sessions,
@@ -102,20 +95,20 @@ st.markdown("""
     }
     </style>
     <div class="credit-footer">
-        Developed for Parekh Lab © 2025
+        Developed for Parekh Lab Â© 2025
             Aryan Bangad
     </div>
 """, unsafe_allow_html=True)
 
 
 with tab3:
-    st.title("🧪 Peri-Event Plot Viewer")
+    st.title("ðŸ§ª Peri-Event Plot Viewer")
 
-    if st.button("🔄 Refresh"):
+    if st.button("ðŸ”„ Refresh"):
         st.rerun()
 
     if "extracted_data" not in st.session_state or "events" not in st.session_state["extracted_data"]:
-        st.warning("❗ Please extract data and events first from the Data Extractor tab.")
+        st.warning("â— Please extract data and events first from the Data Extractor tab.")
     else:
         # Settings
         event_name = st.selectbox(
@@ -156,26 +149,32 @@ with tab3:
                     events = st.session_state.extracted_data.get("events", [])
                     required_pct = peri_pct_idx + 1
                     if len(pct) < required_pct:
-                        st.warning(f"Less than {required_pct} PCT onset(s) found — skipping alignment.")
+                        st.warning(f"Less than {required_pct} PCT onset(s) found â€” skipping alignment.")
                     else:
                         pct_onset = float(pct[peri_pct_idx])
                         code12_times = [e["timestamp_s"] for e in events if e.get("code") == 12]
                         if len(code12_times) < 2:
-                            st.warning("Less than 2 code-12 events found — skipping alignment.")
+                            st.warning("Less than 2 code-12 events found â€” skipping alignment.")
                         else:
-                            offset = compute_pct_offset(pct_onset, code12_times, code12_index=1)
-                            signal, control = _apply_pct_alignment(signal, control, fs, offset)
+                            offset = pct_onset - code12_times[1]
+                            time_full = np.arange(len(signal)) / fs
+                            time_full -= offset
+                            valid = time_full >= 0
+                            signal = signal[valid]
+                            control = control[valid]
                             st.info(f"Applied PCT alignment using {peri_pct_choice}, offset = {offset:.3f} s")
                 except Exception as e:
                     st.warning(f"Alignment failed: {e}")
             # Downsample (block-averaging, Lerner et al. 2015)
             if downsample_factor > 1:
-                signal = downsample_block_average(signal, downsample_factor)
-                control = downsample_block_average(control, downsample_factor)
+                signal = np.array([np.mean(signal[i_:i_+downsample_factor]) for i_ in range(0, len(signal), downsample_factor)])
+                control = np.array([np.mean(control[i_:i_+downsample_factor]) for i_ in range(0, len(control), downsample_factor)])
                 fs = fs / downsample_factor
 
-            signal, control = match_lengths(signal, control)
-            min_len = len(signal)
+            min_len = min(len(signal), len(control))
+            if len(signal) != len(control):
+                signal = signal[:min_len]
+                control = control[:min_len]
 
             # --- Code 0 cutoff ---
             peri_code0_cutoff = st.checkbox("Cut off signal at Code 0 (session end)?", value=False, key="peri_code0_cutoff")
@@ -184,9 +183,12 @@ with tab3:
                 _t3_code0_times = [e["timestamp_s"] for e in _t3_events if e.get("code") == 0]
                 if _t3_code0_times:
                     _t3_code0_t = _t3_code0_times[0]
-                    signal, control = apply_code0_cutoff(signal, control, fs, _t3_code0_t)
+                    _t3_time_arr = np.arange(len(signal)) / fs
+                    _t3_code0_keep = _t3_time_arr <= _t3_code0_t
+                    signal = signal[_t3_code0_keep]
+                    control = control[_t3_code0_keep]
                     min_len = len(signal)
-                    st.info(f"Code 0 cutoff applied at {_t3_code0_t:.2f}s — {len(signal)} samples remain")
+                    st.info(f"Code 0 cutoff applied at {_t3_code0_t:.2f}s â€” {len(signal)} samples remain")
 
             # --- Load splices for regression masking ---
             _t3_block = st.session_state.tdt_settings.get("block_folder", "")
@@ -201,13 +203,14 @@ with tab3:
                 _t3_offset = 0.0
             _t3_splices = offset_splices(_t3_raw_splices, _t3_offset) if _t3_raw_splices else []
 
-            # ΔF/F calculation (exclude spliced regions from polyfit)
+            # Î”F/F calculation (exclude spliced regions from polyfit)
             if _t3_splices:
                 _t3_mask = get_splice_mask(min_len, fs, _t3_splices)
+                fit = np.polyfit(control[_t3_mask], signal[_t3_mask], 1)
             else:
-                _t3_mask = None
-            dFF, _fitted, _coeffs = compute_dff(signal, control,
-                                                splice_mask=_t3_mask, epsilon=0.0)
+                fit = np.polyfit(control, signal, 1)
+            fitted = fit[0] * control + fit[1]
+            dFF = 100 * (signal - fitted) / fitted
 
             TRANGE = [int(-PRE_TIME * fs), int(POST_TIME * fs)]
             snippets = []
@@ -233,7 +236,6 @@ with tab3:
                 if baseline_mode:
                     # ----------------------------
                     # Per-event baseline z-scoring
-                    # (stats from global dFF baseline window, applied to snippet)
                     # ----------------------------
                     baseline_start = int((on + lowerBound) * fs)
                     baseline_end   = int((on + upperBound) * fs)
@@ -253,9 +255,9 @@ with tab3:
                             snippet = snippet - baseline_mean
                 else:
                     # ----------------------------
-                    # Global z-scoring (whole trace stats, excluding spliced regions)
+                    # Global z-scoring (whole trace, excluding spliced regions)
                     # ----------------------------
-                    if _t3_splices and _t3_mask is not None:
+                    if _t3_splices:
                         _t3_clean_dFF = dFF[_t3_mask]
                     else:
                         _t3_clean_dFF = dFF
@@ -270,7 +272,7 @@ with tab3:
             else:
                 snippets = np.array(snippets)
                 mean_snip = np.mean(snippets, axis=0)
-                sem_snip = compute_sem(snippets)
+                sem_snip = np.std(snippets, axis=0) / np.sqrt(snippets.shape[0])
 
                 # peri-event time vector in seconds
                 peri_time = np.arange(TRANGE[0], TRANGE[1]) / fs
@@ -282,21 +284,21 @@ with tab3:
                 for snip in snippets:
                     ax.plot(peri_time, snip, linewidth=0.5, color='gray', alpha=0.5)
 
-                # Mean ± SEM
-                ax.plot(peri_time, mean_snip, color='green', linewidth=2, label='Mean ΔF/F')
+                # Mean Â± SEM
+                ax.plot(peri_time, mean_snip, color='green', linewidth=2, label='Mean Î”F/F')
                 ax.fill_between(peri_time, mean_snip - sem_snip, mean_snip + sem_snip,
-                                color='green', alpha=0.2, label='±SEM')
+                                color='green', alpha=0.2, label='Â±SEM')
 
                 # Event onset marker
                 ax.axvline(0, color='slategray', linestyle='--', linewidth=2, label=f'{event_name} Onset')
 
                 # Labels
                 if baseline_mode:
-                    title_str = f"Peri-Event ΔF/F (Baseline Z-score: {lowerBound}s to {upperBound}s)"
-                    ylabel_str = "ΔF/F (Baseline Z-score)"
+                    title_str = f"Peri-Event Î”F/F (Baseline Z-score: {lowerBound}s to {upperBound}s)"
+                    ylabel_str = "Î”F/F (Baseline Z-score)"
                 else:
-                    title_str = "Peri-Event ΔF/F (Global Z-score)"
-                    ylabel_str = "ΔF/F (Global Z-score)"
+                    title_str = "Peri-Event Î”F/F (Global Z-score)"
+                    ylabel_str = "Î”F/F (Global Z-score)"
 
                 ax.set_title(title_str)
                 ax.set_xlabel("Time (s)")
@@ -307,7 +309,7 @@ with tab3:
                 st.pyplot(fig, width='stretch')
 
 with tab1:
-    st.title("📂 TDT + Events Data Extractor")
+    st.title("ðŸ“‚ TDT + Events Data Extractor")
     base_path = st.text_input("Base folder path", value=st.session_state.tdt_settings["data_folder"] or ".")
     if os.path.isdir(base_path):
         folders = sorted([f for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f)) and not f.startswith(".")])
@@ -323,7 +325,7 @@ with tab1:
             pcts = list(data.epocs.keys())
 
             st.markdown("---")
-            st.subheader("🔌 Select Signal/Control Streams")
+            st.subheader("ðŸ”Œ Select Signal/Control Streams")
             col1, col2 = st.columns(2)
 
             with col1:
@@ -339,7 +341,7 @@ with tab1:
             else:
                 st.session_state.pct_channel = None
 
-            if st.button("📥 Extract Data"):
+            if st.button("ðŸ“¥ Extract Data"):
                 tdt_data = {
                 "signal1": data.streams[st.session_state.signal_stream].data if st.session_state.signal_stream else None,
                 "control1": data.streams[st.session_state.control_stream].data if st.session_state.control_stream else None,
@@ -350,15 +352,15 @@ with tab1:
                 }
 
                 st.session_state["extracted_data"] = tdt_data
-                st.success("✅ TDT Data extracted and stored.")
+                st.success("âœ… TDT Data extracted and stored.")
         except Exception as e:
             st.error(f"Error reading TDT folder: {e}")  
     else:
-        st.warning("⚠️ Please enter a valid folder path.")
+        st.warning("âš ï¸ Please enter a valid folder path.")
 
 
     st.markdown("---")
-    st.subheader("📎 Upload Events")
+    st.subheader("ðŸ“Ž Upload Events")
 
     log_fileCSV = st.file_uploader("Upload OHRBETS event log (`.csv`)", type=["csv"])
     log_fileNXT = st.file_uploader("Upload OpenScope / Synapse event log (`.nxt`)", type=["nxt"])
@@ -367,7 +369,7 @@ with tab1:
         new_file_hash = get_file_hash(log_fileNXT)
 
         if st.session_state.get("last_uploaded_nxt_hash") != new_file_hash:
-        # New file uploaded — reset state
+        # New file uploaded â€” reset state
             st.session_state["last_uploaded_nxt_hash"] = new_file_hash
 
             try:
@@ -383,12 +385,12 @@ with tab1:
                 st.session_state["nxt_codes"] = nxt_codes
                 st.session_state["code_map"] = {code: "" for code in nxt_codes}
 
-                st.info("New `.nxt` file detected — Code map and event codes reset.")
+                st.info("New `.nxt` file detected â€” Code map and event codes reset.")
             finally:
                 os.remove(tmp_path)
 
 # Extract Events Button
-    if st.button("📤 Extract Events"):
+    if st.button("ðŸ“¤ Extract Events"):
         all_events = []
 
         if log_fileCSV:
@@ -409,11 +411,11 @@ with tab1:
             st.session_state["extracted_data"] = {}
 
         st.session_state["extracted_data"]["events"] = all_events
-        st.success(f"✅ Loaded {len(all_events)} events.")
+        st.success(f"âœ… Loaded {len(all_events)} events.")
 
     if log_fileNXT:
         st.markdown("---")
-        st.subheader("📝 Code Map Editor (for `.nxt` event decoding)")
+        st.subheader("ðŸ“ Code Map Editor (for `.nxt` event decoding)")
 
         with st.form("edit_code_map_form"):
             updated_map = {}
@@ -422,7 +424,7 @@ with tab1:
                 label = st.text_input(f"Label for Code {code}", value=default_label, key=f"code_{code}")
                 updated_map[code] = label
 
-            submitted = st.form_submit_button("✅ Save Code Map")
+            submitted = st.form_submit_button("âœ… Save Code Map")
             if submitted:
                 st.session_state.code_map = updated_map
                 st.success("Code map updated.")
@@ -451,7 +453,7 @@ with tab2:
         graph_pct_idx = 1  # default, unused when PCT alignment is off
         cutoff_time = st.number_input("Start time (seconds)", min_value=0.0, value=2.0)
 
-    plot_choice = st.radio("Plot Type", ["ΔF/F", "Z-scored ΔF/F"])
+    plot_choice = st.radio("Plot Type", ["Î”F/F", "Z-scored Î”F/F"])
 
     # --- Code 0 cutoff ---
     code0_cutoff_enabled = st.checkbox("Cut off signal at Code 0 (session end)?", value=False, key="tab2_code0_cutoff")
@@ -480,7 +482,7 @@ with tab2:
     # Signal Splicing UI
     # =====================
     st.markdown("---")
-    st.subheader("✂️ Signal Splicing")
+    st.subheader("âœ‚ï¸ Signal Splicing")
     st.caption(
         "Define time regions to cut from the signal. Spliced regions are "
         "excluded from regression and analysis. They appear as red shading "
@@ -536,23 +538,23 @@ with tab2:
 
         col_add, col_save, col_clear = st.columns(3)
         with col_add:
-            if st.button("➕ Add Splice"):
+            if st.button("âž• Add Splice"):
                 if splice_end_input > splice_start_input:
                     raw_start = splice_start_input + _splice_offset
                     raw_end = splice_end_input + _splice_offset
                     st.session_state[_active_sk].append((raw_start, raw_end))
                     st.session_state[_active_sk].sort(key=lambda x: x[0])
                     save_splices(_splice_block_path, st.session_state[_active_sk], channel=_splice_ch)
-                    st.success(f"Added splice to {_splice_ch_label}: {splice_start_input:.2f}s → {splice_end_input:.2f}s")
+                    st.success(f"Added splice to {_splice_ch_label}: {splice_start_input:.2f}s â†’ {splice_end_input:.2f}s")
                     st.rerun()
                 else:
                     st.error("Splice end must be > splice start.")
         with col_save:
-            if st.button("💾 Save Splices"):
+            if st.button("ðŸ’¾ Save Splices"):
                 save_splices(_splice_block_path, st.session_state.get(_active_sk, []), channel=_splice_ch)
                 st.success(f"Saved {len(st.session_state.get(_active_sk, []))} splice(s) for {_splice_ch_label}.")
         with col_clear:
-            if st.button("🗑️ Clear All Splices"):
+            if st.button("ðŸ—‘ï¸ Clear All Splices"):
                 st.session_state[_active_sk] = []
                 save_splices(_splice_block_path, [], channel=_splice_ch)
                 st.rerun()
@@ -566,9 +568,9 @@ with tab2:
                 disp_e = re_ - _splice_offset
                 c1, c2 = st.columns([5, 1])
                 with c1:
-                    st.text(f"  #{i+1}: {disp_s:.2f}s → {disp_e:.2f}s  (duration: {re_ - rs:.2f}s)")
+                    st.text(f"  #{i+1}: {disp_s:.2f}s â†’ {disp_e:.2f}s  (duration: {re_ - rs:.2f}s)")
                 with c2:
-                    if st.button("🗑️", key=f"del_splice_{_splice_ch}_{i}"):
+                    if st.button("ðŸ—‘ï¸", key=f"del_splice_{_splice_ch}_{i}"):
                         st.session_state[_active_sk].pop(i)
                         save_splices(_splice_block_path, st.session_state[_active_sk], channel=_splice_ch)
                         st.rerun()
@@ -579,7 +581,7 @@ with tab2:
 
     if st.button("Generate Plot"):
         if "extracted_data" not in st.session_state:
-            st.error("❌ No TDT data loaded. Please use the Data Extractor tab.")
+            st.error("âŒ No TDT data loaded. Please use the Data Extractor tab.")
             st.stop()
         data = st.session_state.extracted_data
         try:
@@ -603,11 +605,12 @@ with tab2:
 
         def compute_trace(signal, control, label_prefix, ch_display_splices):
             # Pre-downsample length clamp (YARA indexing fix)
-            signal, control = match_lengths(signal, control)
+            min_len = min(len(signal), len(control))
+            signal = signal[:min_len]
+            control = control[:min_len]
 
-            # Block-averaging downsample (Lerner et al. 2015)
-            signal_ds = downsample_block_average(signal, downsample_factor)
-            control_ds = downsample_block_average(control, downsample_factor)
+            signal_ds = np.array([np.mean(signal[i_:i_+downsample_factor]) for i_ in range(0, len(signal), downsample_factor)])
+            control_ds = np.array([np.mean(control[i_:i_+downsample_factor]) for i_ in range(0, len(control), downsample_factor)])
             time = np.arange(len(signal_ds)) / data["fs"] * downsample_factor
 
             time -= offset
@@ -623,27 +626,38 @@ with tab2:
             signal_ds = signal_ds[valid]
             control_ds = control_ds[valid]
 
-            signal_ds, control_ds, time = match_lengths(signal_ds, control_ds, time)
+            min_len_ds = min(len(signal_ds), len(control_ds))
+            signal_ds = signal_ds[:min_len_ds]
+            control_ds = control_ds[:min_len_ds]
+            time = time[:min_len_ds]
 
             # --- Code 0 cutoff: truncate after code 0 timestamp ---
             if code0_cutoff_enabled and "events" in data and data["events"]:
                 code0_times = [e["timestamp_s"] for e in data["events"] if e.get("code") == 0]
                 if code0_times:
-                    time, signal_ds, control_ds = apply_code0_cutoff_with_time(
-                        time, signal_ds, control_ds, code0_times[0]
-                    )
+                    code0_t = code0_times[0]  # first code 0
+                    code0_keep = time <= code0_t
+                    time = time[code0_keep]
+                    signal_ds = signal_ds[code0_keep]
+                    control_ds = control_ds[code0_keep]
 
-            # ΔF/F calculation (exclude spliced samples from polyfit)
+            # Use splice mask to exclude spliced samples from polyfit
             if ch_display_splices:
                 ds_fs = data["fs"] / downsample_factor
                 smask = get_splice_mask(len(signal_ds), ds_fs, ch_display_splices)
+                fit = np.polyfit(control_ds[smask], signal_ds[smask], 1)
             else:
-                smask = None
-            dF, _fitted, _coeffs = compute_dff(signal_ds, control_ds,
-                                               splice_mask=smask, epsilon=0.0)
+                fit = np.polyfit(control_ds, signal_ds, 1)
+
+            fitted = fit[0] * control_ds + fit[1]
+            dF = 100 * ((signal_ds - fitted) / fitted)
 
             # Z-score: compute mean/std only on non-spliced samples
-            dF_z = zscore_global(dF, splice_mask=smask)
+            if ch_display_splices:
+                dF_clean = dF[smask]
+            else:
+                dF_clean = dF
+            dF_z = (dF - np.mean(dF_clean)) / (np.std(dF_clean) if np.std(dF_clean) > 0 else 1.0)
 
             trace_results[label_prefix] = {
                 "time": time, "dF": dF, "dF_z": dF_z
@@ -661,12 +675,12 @@ with tab2:
         st.session_state["tab2_plot_choice"] = plot_choice
         st.session_state["tab2_enabled_events"] = dict(enabled_events)
         st.session_state["tab2_code_colors"] = dict(code_colors) if enabled_events else {}
-        st.success("✅ Plot generated. Scroll down to view.")
+        st.success("âœ… Plot generated. Scroll down to view.")
 
     # --- Render persisted plots (survives splice edits without re-generating) ---
     if "tab2_traces" in st.session_state:
         trace_results = st.session_state["tab2_traces"]
-        _plot_choice = st.session_state.get("tab2_plot_choice", "ΔF/F")
+        _plot_choice = st.session_state.get("tab2_plot_choice", "Î”F/F")
         _enabled_events = st.session_state.get("tab2_enabled_events", {})
         _code_colors = st.session_state.get("tab2_code_colors", {})
 
@@ -682,10 +696,10 @@ with tab2:
             _ch_splices["Channel 2"] = st.session_state.get("tab2_display_splices_ch2", [])
 
         # ========== GRAPH 1: Full trace with splice overlay ==========
-        st.subheader("📈 Full Trace (with splice regions highlighted)")
+        st.subheader("ðŸ“ˆ Full Trace (with splice regions highlighted)")
         fig1 = go.Figure()
         for label, td in trace_results.items():
-            y_data = td["dF"] if _plot_choice == "ΔF/F" else td["dF_z"]
+            y_data = td["dF"] if _plot_choice == "Î”F/F" else td["dF_z"]
             color = "blue" if "1" in label else "green"
             if label == "Channel 2":
                 y_data = y_data + 3  # offset channel 2
@@ -742,12 +756,12 @@ with tab2:
                 ))
 
         fig1.update_layout(
-            title=dict(text="Fiber Photometry — Full Trace with Splice Regions", font=dict(color='black')),
+            title=dict(text="Fiber Photometry â€” Full Trace with Splice Regions", font=dict(color='black')),
             template="plotly_white",
             xaxis=dict(title=dict(text="Time (s)", font=dict(color='black')),
                        color='black', tickfont=dict(color='black'),
                        rangeslider=dict(visible=True)),
-            yaxis=dict(title=dict(text="ΔF/F (%)" if _plot_choice == "ΔF/F" else "Z-scored ΔF/F",
+            yaxis=dict(title=dict(text="Î”F/F (%)" if _plot_choice == "Î”F/F" else "Z-scored Î”F/F",
                                   font=dict(color='black')),
                        color='black', tickfont=dict(color='black')),
             font=dict(color="black"), plot_bgcolor='white',
@@ -757,7 +771,7 @@ with tab2:
         st.plotly_chart(fig1, use_container_width=True)
 
         # ========== GRAPH 2: Spliced trace (samples removed) ==========
-        st.subheader("📉 Spliced Trace (splice regions removed)")
+        st.subheader("ðŸ“‰ Spliced Trace (splice regions removed)")
         fig2 = go.Figure()
         for label, td in trace_results.items():
             time_arr = td["time"]
@@ -775,7 +789,7 @@ with tab2:
             dF_clean = dF_arr[keep]
             dF_z_clean = dF_z_arr[keep]
 
-            y_data = dF_clean if _plot_choice == "ΔF/F" else dF_z_clean
+            y_data = dF_clean if _plot_choice == "Î”F/F" else dF_z_clean
             color = "blue" if "1" in label else "green"
             if label == "Channel 2":
                 y_data = y_data + 3
@@ -786,12 +800,12 @@ with tab2:
             ))
 
         fig2.update_layout(
-            title=dict(text="Fiber Photometry — Spliced Trace", font=dict(color='black')),
+            title=dict(text="Fiber Photometry â€” Spliced Trace", font=dict(color='black')),
             template="plotly_white",
             xaxis=dict(title=dict(text="Time (s)", font=dict(color='black')),
                        color='black', tickfont=dict(color='black'),
                        rangeslider=dict(visible=True)),
-            yaxis=dict(title=dict(text="ΔF/F (%)" if _plot_choice == "ΔF/F" else "Z-scored ΔF/F",
+            yaxis=dict(title=dict(text="Î”F/F (%)" if _plot_choice == "Î”F/F" else "Z-scored Î”F/F",
                                   font=dict(color='black')),
                        color='black', tickfont=dict(color='black')),
             font=dict(color="black"), plot_bgcolor='white',
@@ -801,10 +815,10 @@ with tab2:
         st.plotly_chart(fig2, use_container_width=True)
 
         # ========== DATA EXPORT ==========
-        st.subheader("📥 Export Trace Data")
+        st.subheader("ðŸ“¥ Export Trace Data")
         st.caption(
             "Export the full trace with spliced regions removed. "
-            "Includes time, ΔF/F, and Z-scored ΔF/F for each channel."
+            "Includes time, Î”F/F, and Z-scored Î”F/F for each channel."
         )
 
         for label, td in trace_results.items():
@@ -858,7 +872,7 @@ with tab2:
             col_csv, col_npy, col_dff_npy, col_dffz_npy = st.columns(4)
             with col_csv:
                 st.download_button(
-                    label=f"📄 {label} CSV",
+                    label=f"ðŸ“„ {label} CSV",
                     data=csv_buf,
                     file_name=f"{safe_label}_trace_spliced.csv",
                     mime="text/csv",
@@ -866,7 +880,7 @@ with tab2:
                 )
             with col_npy:
                 st.download_button(
-                    label=f"💾 {label} NPZ",
+                    label=f"ðŸ’¾ {label} NPZ",
                     data=npy_buf,
                     file_name=f"{safe_label}_trace_spliced.npz",
                     mime="application/octet-stream",
@@ -874,7 +888,7 @@ with tab2:
                 )
             with col_dff_npy:
                 st.download_button(
-                    label=f"📊 {label} dF/F (.npy)",
+                    label=f"ðŸ“Š {label} dF/F (.npy)",
                     data=npy_dff_buf,
                     file_name=f"{safe_label}_dFF.npy",
                     mime="application/octet-stream",
@@ -882,7 +896,7 @@ with tab2:
                 )
             with col_dffz_npy:
                 st.download_button(
-                    label=f"📊 {label} Z-dF/F (.npy)",
+                    label=f"ðŸ“Š {label} Z-dF/F (.npy)",
                     data=npy_dff_z_buf,
                     file_name=f"{safe_label}_dFF_zscore.npy",
                     mime="application/octet-stream",
@@ -890,18 +904,18 @@ with tab2:
                 )
 
 with tab4:
-    st.title("📊 Multi-Block Fiber Photometry Analyzer")
+    st.title("ðŸ“Š Multi-Block Fiber Photometry Analyzer")
 
     # --- Step 1: Select Directory ---
     path = st.text_input("Enter path to parent directory:", "D:\\Fiberphotometry")
 
     # --- Load Metadata ---
-    if st.button("🔍 Load Metadata"):
+    if st.button("ðŸ” Load Metadata"):
         with st.spinner("Scanning for TDT blocks..."):
             tdt_paths = get_tdt_block_paths_with_events(path)
             metadata = get_sessions_by_mouseIDs(tdt_paths)
             st.session_state["metadata"] = metadata
-            st.success(f"✅ Found {len(metadata)} TDT sessions!")
+            st.success(f"âœ… Found {len(metadata)} TDT sessions!")
 
     # --- Step 2: Display Metadata ---
     if "metadata" in st.session_state:
@@ -910,7 +924,7 @@ with tab4:
             df = df.sort_values("datetime")
 
         # --- Optional Filters ---
-        with st.expander("🔍 Filter Sessions"):
+        with st.expander("ðŸ” Filter Sessions"):
             selected_experiments = st.multiselect(
                 "Filter by Experiment", sorted(df["Experiment"].unique())
             )
@@ -932,7 +946,7 @@ with tab4:
         st.markdown("---")
 
         # --- Step 3: Load or Create Custom Groups ---
-        st.header("🧩 Custom Group Builder")
+        st.header("ðŸ§© Custom Group Builder")
 
         # Auto-load previously saved groups if not already loaded
         group_file = os.path.join(path, "group_assignments.json")
@@ -954,7 +968,7 @@ with tab4:
 
         # Create a new group
         new_group = st.text_input("Create new group (e.g., Control, Lesion, Drug):")
-        if st.button("➕ Add Group"):
+        if st.button("âž• Add Group"):
             if new_group and new_group not in st.session_state["groups"]:
                 st.session_state["groups"][new_group] = {}
                 st.success(f"Added group '{new_group}'!")
@@ -965,10 +979,10 @@ with tab4:
         for group_name, group_data in list(st.session_state["groups"].items()):
             cols = st.columns([4, 1])
             with cols[0]:
-                st.subheader(f"📂 {group_name}")
+                st.subheader(f"ðŸ“‚ {group_name}")
             with cols[1]:
         # Button to delete the group
-                if st.button("🗑️ Delete", key=f"delete_{group_name}"):
+                if st.button("ðŸ—‘ï¸ Delete", key=f"delete_{group_name}"):
                     del st.session_state["groups"][group_name]
                     st.rerun()  # refresh UI after deletion
 
@@ -1027,14 +1041,14 @@ with tab4:
 
         # --- Step 5: Group Summary ---
         if st.session_state["groups"]:
-            st.subheader("📋 Group Summary")
+            st.subheader("ðŸ“‹ Group Summary")
             for group, mice in st.session_state["groups"].items():
-                st.markdown(f"**🧩 {group}**")
+                st.markdown(f"**ðŸ§© {group}**")
                 for mouse, sessions in mice.items():
-                    st.write(f" - 🐭 {mouse}: {len(sessions)} session(s)")
+                    st.write(f" - ðŸ­ {mouse}: {len(sessions)} session(s)")
 
             # --- Step 6: Save Group Assignments ---
-            if st.button("💾 Save Group Assignments"):
+            if st.button("ðŸ’¾ Save Group Assignments"):
                 save_path = os.path.join(path, "group_assignments.json")
                 with open(save_path, "w") as f:
                     json.dump(st.session_state["groups"], f, indent=2)
@@ -1077,18 +1091,12 @@ with tab4:
 
             # --- Code 0 cutoff ---
             batch_code0_cutoff = st.checkbox("Cut off signal at Code 0 (session end)?", value=False, key="batch_code0_cutoff")
-
-            # --- Signal start cutoff ---
-            batch_signal_start_cutoff = st.number_input("Signal start cutoff (s) [Trims early session signal]", min_value=0.0, value=0.0, step=1.0)
-            
-            # --- Global Z-score approach ---
-            batch_global_zscore = st.checkbox("Use global session-mean Z-scoring (New Approach)", value=False, key="batch_global_zscore")
-
+            signal_start_cutoff = st.number_input("Signal start cutoff (s)", min_value=0.0, value=2.0, step=0.1, key="batch_signal_start_cutoff")
             pre_t = st.number_input("Peri-event PRE time (s)", min_value=0.0, value=5.0)
             post_t = st.number_input("Peri-event POST time (s)", min_value=0.0, value=10.0)
             baseline_lower = st.number_input("Baseline window start (s, relative to T0, negative)", value=-4.0)
             baseline_upper = st.number_input("Baseline window end (s, relative to T0, negative or <0)", value=-1.0)
-            downsample_factor = st.number_input("Downsample factor (integer ≥1)", min_value=1, value=1, step=1)
+            downsample_factor = st.number_input("Downsample factor (integer â‰¥1)", min_value=1, value=1, step=1)
             metric_start = st.number_input("Metric window start (s, relative to T0)", value=0.0)
             metric_end = st.number_input("Metric window end (s, relative to T0)", value=5.0)
 
@@ -1107,7 +1115,7 @@ with tab4:
                 all_metrics = []  # rows for CSV
 
                 # Processing button
-                if st.button("▶️ Run Averaging & Save Plots"):
+                if st.button("â–¶ï¸ Run Averaging & Save Plots"):
                     with st.spinner("Running batch processing..."):
                         try:
                             # Build per-session PCT onset map from epoch_choices
@@ -1133,8 +1141,7 @@ with tab4:
                                 pct_onset_index=1,  # fallback; overridden per-session by pct_onset_map
                                 pct_onset_map=_pct_onset_map,
                                 code0_cutoff=batch_code0_cutoff,
-                                signal_start_cutoff=batch_signal_start_cutoff,
-                                global_zscore=batch_global_zscore,
+                                signal_start_cutoff=signal_start_cutoff,
                             )
                             st.success(f"Processing complete. Output folder: {summary['output_files']['event_folder']}")
                             st.write(summary)  # visible run summary in the UI
@@ -1144,10 +1151,10 @@ with tab4:
                             st.text(traceback.format_exc())
 
 with tab5:
-    st.title("📊 Advanced Graphing")
+    st.title("ðŸ“Š Advanced Graphing")
     st.markdown("Post-hoc visualization of batch-processed data")
 
-    # ── 1. Select Data Folder ──────────────────────────────────────────────
+    # â”€â”€ 1. Select Data Folder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     st.header("1. Select Data Folder")
 
     adv_base_path = st.text_input(
@@ -1157,7 +1164,7 @@ with tab5:
     )
 
     if not os.path.isdir(adv_base_path):
-        st.warning("⚠️ Please enter a valid folder path.")
+        st.warning("âš ï¸ Please enter a valid folder path.")
     else:
         adv_folders = sorted(
             f for f in os.listdir(adv_base_path)
@@ -1175,7 +1182,7 @@ with tab5:
             )
             adv_full_path = os.path.join(adv_base_path, adv_selected_folder)
 
-            # ── 2. Select Event Folder ─────────────────────────────────────
+            # â”€â”€ 2. Select Event Folder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             st.header("2. Select Event Folder")
 
             adv_event_folders = discover_event_folders(adv_full_path)
@@ -1199,19 +1206,19 @@ with tab5:
                 )
 
                 # Debug: show what's inside the event folder
-                with st.expander("📁 Event folder contents (debug)"):
+                with st.expander("ðŸ“ Event folder contents (debug)"):
                     st.caption(f"Path: `{adv_event_path}`")
                     if os.path.isdir(adv_event_path):
                         for item in sorted(os.listdir(adv_event_path)):
                             full_item = os.path.join(adv_event_path, item)
                             if os.path.isdir(full_item):
-                                st.text(f"📁 {item}/")
+                                st.text(f"ðŸ“ {item}/")
                             else:
                                 st.text(f"   {item}")
                     else:
                         st.error(f"Path does not exist!")
 
-                # ── 3. Choose Graph Type ───────────────────────────────────
+                # â”€â”€ 3. Choose Graph Type â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 st.header("3. Choose Graph Type")
 
                 adv_graph_type = st.radio(
@@ -1224,7 +1231,7 @@ with tab5:
                     key="adv_graph_type",
                 )
 
-                # Map display name → internal key
+                # Map display name â†’ internal key
                 _graph_type_map = {
                     "Signal Mean Bar Plot": "signal_mean",
                     "AUC Bar Plot": "auc",
@@ -1250,7 +1257,7 @@ with tab5:
                     adv_csv_map = discover_prism_sessions(adv_event_path)
                     csv_label = "prism session CSVs"
 
-                # ── 4. Select Sessions ─────────────────────────────────────
+                # â”€â”€ 4. Select Sessions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 st.header("4. Select Sessions")
 
                 if not adv_csv_map:
@@ -1283,12 +1290,12 @@ with tab5:
                             f"{len(adv_selected_csvs)} session(s) selected"
                         )
 
-                        # ── 5. Parameters ──────────────────────────────────
+                        # â”€â”€ 5. Parameters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                         st.header("5. Parameters")
 
                         adv_signal_type = st.radio(
                             "Signal type:",
-                            ["z-score", "raw ΔF/F"],
+                            ["z-score", "raw Î”F/F"],
                             key="adv_signal_type",
                         )
 
@@ -1332,18 +1339,18 @@ with tab5:
                             )
                             adv_window_valid = False
 
-                        # ── 6. Generate ────────────────────────────────────
+                        # â”€â”€ 6. Generate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                         st.header("6. Generate")
 
                         generate_disabled = not adv_window_valid
 
                         if st.button(
-                            "🚀 Generate Plots",
+                            "ðŸš€ Generate Plots",
                             type="primary",
                             disabled=generate_disabled,
                             key="adv_generate",
                         ):
-                            with st.spinner("Generating plots…"):
+                            with st.spinner("Generating plotsâ€¦"):
                                 try:
                                     output_root = os.path.join(
                                         adv_event_path,
@@ -1418,7 +1425,7 @@ with tab5:
                                     )
 
                                     st.success(
-                                        f"✅ Done! Processed "
+                                        f"âœ… Done! Processed "
                                         f"{adv_summary['n_sessions_processed']}"
                                         f" session(s)."
                                     )
@@ -1457,6 +1464,8 @@ with tab5:
                                         )
 
                                 except Exception as e:
-                                    st.error(f"❌ Error: {e}")
+                                    st.error(f"âŒ Error: {e}")
                                     import traceback
                                     st.text(traceback.format_exc())
+
+

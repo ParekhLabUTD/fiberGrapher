@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import math
 import itertools
@@ -13,13 +13,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from splice_utils import load_splices, get_splice_mask, check_snippet_overlaps_splice, offset_splices
-from math_utils import (
-    downsample_block_average, match_lengths, compute_dff,
-    zscore_baseline_with_fallback, compute_sem,
-    apply_pct_alignment as _apply_pct_alignment,
-    apply_code0_cutoff, compute_pct_offset,
-    compute_peri_time_vector, compute_trial_metrics,
-)
 
 # helper safe name
 def _safe_name(s: str) -> str:
@@ -81,8 +74,7 @@ def run_batch_processing(
     pct_onset_index=1,
     pct_onset_map=None,
     code0_cutoff=False,
-    signal_start_cutoff=0.0,
-    global_zscore=False
+    signal_start_cutoff=0.0
 ):
     timestamp_str = dt.now().strftime("%Y%m%d_%H%M%S")
     event_folder = os.path.join(base_path, "plots", f"{_safe_name(selected_event)}_{timestamp_str}")
@@ -236,7 +228,7 @@ def run_batch_processing(
                     print(f"PCT onset index for this session: {_session_pct_idx}", flush=True)
 
                 try:
-                    if meta.get('event_interpretor', 1) == 2:
+                    if meta.get('interpretor', 1) == 2:
                         pct_name = 'PtC1' if meta.get('signalChannelSet',1) == 1 else 'PtC2'
                         onset_list = None
                         try:
@@ -247,8 +239,12 @@ def run_batch_processing(
                         required_pct = _session_pct_idx + 1
                         if onset_list is not None and len(onset_list) >= required_pct and len(code12_times) >= 2:
                             pct_onset = float(onset_list[_session_pct_idx])
-                            offset = compute_pct_offset(pct_onset, code12_times, code12_index=1)
-                            sig, ctrl = _apply_pct_alignment(sig, ctrl, fs_orig, offset)
+                            offset = pct_onset - code12_times[1]
+                            time_full = np.arange(len(sig)) / fs_orig
+                            time_full -= offset
+                            valid = time_full >= 0
+                            sig = sig[valid]
+                            ctrl = ctrl[valid]
                             event_times = [t - offset for t in event_times]
                             if verbose:
                                 print(f"Alignment applied using PCT onset index {_session_pct_idx}, code12 index 1. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
@@ -258,27 +254,31 @@ def run_batch_processing(
                 except Exception as e:
                     print("WARNING: alignment failed:", e, flush=True)
 
-                # --- Code 0 cutoff: truncate signal/control after code 0 timestamp ---
-                if code0_cutoff:
-                    _code0_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 0]
-                    if _code0_times:
-                        _code0_t = _code0_times[0]
-                        sig, ctrl = apply_code0_cutoff(sig, ctrl, fs_orig, _code0_t)
-                        event_times = [t for t in event_times if t <= _code0_t]
-                        if verbose:
-                            print(f"Code 0 cutoff at {_code0_t:.2f}s -> {len(sig)} samples remain", flush=True)
-
                 # --- Signal start cutoff: match Tab 2 by dropping bad early signal before z-scoring ---
                 signal_start_cutoff = float(signal_start_cutoff or 0.0)
                 if signal_start_cutoff > 0:
                     start_sample = int(round(signal_start_cutoff * fs_orig))
-                    if start_sample > 0 and start_sample < len(sig):
+                    if start_sample > 0:
                         sig = sig[start_sample:]
                         ctrl = ctrl[start_sample:]
                         event_times = [t - signal_start_cutoff for t in event_times]
                         event_times = [t for t in event_times if t >= 0]
                         if verbose:
                             print(f"Signal start cutoff at {signal_start_cutoff:.2f}s -> {len(sig)} samples remain; events shifted by -{signal_start_cutoff:.2f}s", flush=True)
+
+
+                # --- Code 0 cutoff: truncate signal/control after code 0 timestamp ---
+                if code0_cutoff:
+                    _code0_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 0]
+                    if _code0_times:
+                        _code0_t = _code0_times[0]
+                        _time_arr = np.arange(len(sig)) / fs_orig
+                        _code0_keep = _time_arr <= _code0_t
+                        sig = sig[_code0_keep]
+                        ctrl = ctrl[_code0_keep]
+                        event_times = [t for t in event_times if t <= _code0_t]
+                        if verbose:
+                            print(f"Code 0 cutoff at {_code0_t:.2f}s -> {len(sig)} samples remain", flush=True)
 
                 if len(event_times) == 0:
                     warn = f"no '{selected_event}' events in session {s_path}"
@@ -297,8 +297,8 @@ def run_batch_processing(
                 ds = int(downsample_factor)
                 if ds > 1:
                     # Block-averaging downsample (Lerner et al. 2015)
-                    sig = downsample_block_average(sig, ds)
-                    ctrl = downsample_block_average(ctrl, ds)
+                    sig = np.array([np.mean(sig[i_:i_+ds]) for i_ in range(0, len(sig), ds)])
+                    ctrl = np.array([np.mean(ctrl[i_:i_+ds]) for i_ in range(0, len(ctrl), ds)])
                     fs = fs_orig / ds
                 else:
                     fs = fs_orig
@@ -307,47 +307,45 @@ def run_batch_processing(
                     print(f"After downsampling: sig_len={len(sig)}, fs={fs}", flush=True)
 
                 # --- Safe truncation before regression ---
-                _orig_sig_len, _orig_ctrl_len = len(sig), len(ctrl)
-                sig, ctrl = match_lengths(sig, ctrl)
-                min_len = len(sig)
-                if _orig_sig_len != _orig_ctrl_len:
+                min_len = min(len(sig), len(ctrl))
+                if len(sig) != len(ctrl):
                     if verbose:
-                        print(f"Signal/control length mismatch: sig={_orig_sig_len}, ctrl={_orig_ctrl_len}. Truncating to {min_len}.", flush=True)
+                        print(f"Signal/control length mismatch: sig={len(sig)}, ctrl={len(ctrl)}. Truncating to {min_len}.", flush=True)
+                    sig = sig[:min_len]
+                    ctrl = ctrl[:min_len]
 
                 try:
                     # Exclude spliced regions from polyfit regression
                     if block_splices:
                         splice_mask = get_splice_mask(min_len, fs, block_splices)
+                        p = np.polyfit(ctrl[splice_mask], sig[splice_mask], 1)
                     else:
-                        splice_mask = None
-                    dff, _fitted, _coeffs = compute_dff(sig, ctrl,
-                                                        splice_mask=splice_mask,
-                                                        epsilon=1e-12)
+                        p = np.polyfit(ctrl, sig, 1)
+                    fitted = p[0] * ctrl + p[1]
+                    dff = 100.0 * (sig - fitted) / (fitted + 1e-12)
                 except Exception as e:
                     err = f"regression_dff_failed: {e}"
                     print("ERROR:", err, flush=True)
                     summary["errors"].append({"session": s_path, "error": err})
                     continue
 
-                if global_zscore:
-                    dff_mean = float(np.mean(dff))
-                    dff_std = float(np.std(dff))
-                    if dff_std > 0:
-                        dff_z_session = (dff - dff_mean) / dff_std
-                    else:
-                        dff_z_session = dff - dff_mean
+                dff_mean = float(np.mean(dff))
+                dff_std = float(np.std(dff))
+                if dff_std > 0:
+                    dff_z_session = (dff - dff_mean) / dff_std
+                else:
+                    dff_z_session = dff - dff_mean
 
                 if verbose:
-                    print(f"Computed dF/F len={len(dff)} mean={np.mean(dff):.3f} std={np.std(dff):.3f}", flush=True)
-                    if global_zscore:
-                        print(f"Using full-session z-score for peri-event traces", flush=True)
+                    print(f"Computed dF/F len={len(dff)} mean={dff_mean:.3f} std={dff_std:.3f}; using full-session z-score for peri-event traces", flush=True)
 
-                peri_times, n_samples = compute_peri_time_vector(pre_t, post_t, fs)
+                n_samples = int(round((pre_t + post_t) * fs))
                 if n_samples <= 0:
                     err = f"invalid n_samples computed: {(pre_t+post_t)}*{fs} -> {n_samples}"
                     print("ERROR:", err, flush=True)
                     summary["errors"].append({"session": s_path, "error": err})
                     continue
+                peri_times = (np.arange(n_samples) / fs) - pre_t
 
                 if verbose:
                     print(f"Peri window samples: {n_samples}, peri_times[0:3]={peri_times[:3]}", flush=True)
@@ -367,9 +365,9 @@ def run_batch_processing(
                     start_idx = int(round((ts - pre_t) * fs))
                     end_idx = start_idx + n_samples
                     trial_index += 1
-                    if start_idx < 0 or end_idx > len(dff):
+                    if start_idx < 0 or end_idx > len(dff_z_session):
                         if verbose:
-                            print(f"  Skip trial {trial_index}: start={start_idx} end={end_idx} out of bounds (len={len(dff)})", flush=True)
+                            print(f"  Skip trial {trial_index}: start={start_idx} end={end_idx} out of bounds (len={len(dff_z_session)})", flush=True)
                         summary["invalid_trials"] += 1
                         summary["n_trials_total"] += 1
                         continue
@@ -382,65 +380,55 @@ def run_batch_processing(
                         summary["n_trials_total"] += 1
                         continue
 
+                    snippet = dff_z_session[start_idx:end_idx].astype(float)
+
                     bstart_rel = int(round((baseline_lower + pre_t) * fs))
                     bend_rel = int(round((baseline_upper + pre_t) * fs))
-
-                    if global_zscore:
-                        snippet = dff_z_session[start_idx:end_idx].astype(float)
-                        bstart_rel = max(0, bstart_rel)
-                        bend_rel = min(len(snippet), bend_rel)
-                        if bend_rel > bstart_rel:
-                            baseline_vals = snippet[bstart_rel:bend_rel]
-                            mu = float(np.mean(baseline_vals))
+                    bstart_rel = max(0, bstart_rel)
+                    bend_rel = min(len(snippet), bend_rel)
+                    if bend_rel > bstart_rel:
+                        baseline_vals = snippet[bstart_rel:bend_rel]
+                        mu = float(np.mean(baseline_vals))
+                        snippet_z = snippet - mu
+                        zscored_flag = True
+                    else:
+                        fallback_end = int(round(pre_t * fs))
+                        if fallback_end > 0:
+                            fallback_vals = snippet[:fallback_end]
+                            mu = float(np.mean(fallback_vals))
                             snippet_z = snippet - mu
                             zscored_flag = True
                         else:
-                            fallback_end = int(round(pre_t * fs))
-                            if fallback_end > 0:
-                                fallback_vals = snippet[:fallback_end]
-                                mu = float(np.mean(fallback_vals))
-                                snippet_z = snippet - mu
-                                zscored_flag = True
-                            else:
-                                mu = float(np.mean(dff_z_session))
-                                snippet_z = snippet - mu
-                                zscored_flag = True
-                        
-                        peri_traces.append(snippet_z)
+                            mu = float(np.mean(dff_z_session))
+                            snippet_z = snippet - mu
+                            zscored_flag = True
+                    mstart_idx = int(round((pre_t + metric_start) * fs))
+                    mend_idx = int(round((pre_t + metric_end) * fs))
+                    mstart_idx = max(0, mstart_idx)
+                    mend_idx = min(len(snippet_z), mend_idx)
+
+                    if mend_idx > mstart_idx:
+                        post_segment = snippet_z[mstart_idx:mend_idx]
+                        auc = float(np.sum((post_segment[:-1] + post_segment[1:]) * 0.5) / fs) if len(post_segment) > 1 else 0.0
+
+                        # Detect excitatory vs inhibitory response:
+                        # use whichever extreme has the larger absolute value
+                        seg_max = float(np.max(post_segment))
+                        seg_min = float(np.min(post_segment))
+                        if abs(seg_min) > abs(seg_max):
+                            # Inhibitory: nadir is the dominant peak
+                            peak = seg_min
+                            latency_idx = int(np.argmin(post_segment))
+                        else:
+                            # Excitatory (or flat): max is the dominant peak
+                            peak = seg_max
+                            latency_idx = int(np.argmax(post_segment))
+                        latency = float(latency_idx / fs + metric_start)
                     else:
-                        snippet = dff[start_idx:end_idx].astype(float)
-                        fallback_end = int(round(pre_t * fs))
-                        global_mean = float(np.mean(dff))
-                        snippet_z, zscored_flag = zscore_baseline_with_fallback(
-                            snippet, bstart_rel, bend_rel,
-                            fallback_end_idx=fallback_end,
-                            global_mean=global_mean
-                        )
+                        peak, auc, latency = np.nan, np.nan, np.nan
 
-                        metrics = compute_trial_metrics(
-                            snippet_z, fs, metric_start, metric_end, pre_t,
-                            detect_inhibitory=True
-                        )
-                        peak = metrics["peak"]
-                        auc = metrics["auc"]
-                        latency = metrics["latency"]
-
-                        peri_traces.append(snippet_z)
-                        session_metric_rows.append({
-                            "group": group_name,
-                            "mouse": mouse_id,
-                            "session": os.path.basename(s_path),
-                            "trial_index": trial_index,
-                            "peak": peak,
-                            "auc": auc,
-                            "latency": latency,
-                            "n_timepoints": len(snippet_z),
-                            "zscored": bool(zscored_flag),
-                            "fs": fs,
-                            "signalChannelSet": scs
-                        })
-
-                        all_trial_rows.append(session_metric_rows[-1])
+                    peri_traces.append(snippet_z)
+                    # Metrics are computed below from the session mean trace, not per trial.
                     summary["n_trials_total"] += 1
                     summary["valid_trials"] += 1
 
@@ -451,46 +439,46 @@ def run_batch_processing(
 
                 peri_arr = np.vstack(peri_traces)
                 session_mean = np.mean(peri_arr, axis=0)
-                session_sem = compute_sem(peri_arr)
+                session_sem = peri_arr.std(axis=0) / math.sqrt(peri_arr.shape[0])
 
-                if global_zscore:
-                    baseline_mask = (peri_times >= baseline_lower) & (peri_times <= baseline_upper)
-                    response_mask = (peri_times >= metric_start) & (peri_times <= metric_end)
+                # Metrics from the average response shape (session mean trace)
+                baseline_mask = (peri_times >= baseline_lower) & (peri_times <= baseline_upper)
+                response_mask = (peri_times >= metric_start) & (peri_times <= metric_end)
 
-                    baseline_segment = session_mean[baseline_mask]
-                    response_segment = session_mean[response_mask]
-                    response_times = peri_times[response_mask]
+                baseline_segment = session_mean[baseline_mask]
+                response_segment = session_mean[response_mask]
+                response_times = peri_times[response_mask]
 
-                    baseline_mean = float(np.mean(baseline_segment)) if len(baseline_segment) > 0 else np.nan
-                    response_mean = float(np.mean(response_segment)) if len(response_segment) > 0 else np.nan
-                    delta = response_mean - baseline_mean if np.isfinite(response_mean) and np.isfinite(baseline_mean) else np.nan
+                baseline_mean = float(np.mean(baseline_segment)) if len(baseline_segment) > 0 else np.nan
+                response_mean = float(np.mean(response_segment)) if len(response_segment) > 0 else np.nan
+                delta = response_mean - baseline_mean if np.isfinite(response_mean) and np.isfinite(baseline_mean) else np.nan
 
-                    if len(response_segment) > 0:
-                        peak_idx = int(np.argmax(np.abs(response_segment)))
-                        peak = float(response_segment[peak_idx])
-                        latency = float(response_times[peak_idx])
-                        auc = float(np.sum((response_segment[:-1] + response_segment[1:]) * 0.5 * np.diff(response_times))) if len(response_segment) > 1 else 0.0
-                    else:
-                        peak, latency, auc = np.nan, np.nan, np.nan
+                if len(response_segment) > 0:
+                    peak_idx = int(np.argmax(np.abs(response_segment)))
+                    peak = float(response_segment[peak_idx])
+                    latency = float(response_times[peak_idx])
+                    auc = float(np.sum((response_segment[:-1] + response_segment[1:]) * 0.5 * np.diff(response_times))) if len(response_segment) > 1 else 0.0
+                else:
+                    peak, latency, auc = np.nan, np.nan, np.nan
 
-                    session_metric_rows = [{
-                        "group": group_name,
-                        "mouse": mouse_id,
-                        "session": os.path.basename(s_path),
-                        "metric_source": "session_mean_trace",
-                        "baseline_mean": baseline_mean,
-                        "response_mean": response_mean,
-                        "delta": delta,
-                        "peak": peak,
-                        "auc": auc,
-                        "latency": latency,
-                        "n_trials": int(peri_arr.shape[0]),
-                        "n_timepoints": int(peri_arr.shape[1]),
-                        "session_z_baseline_corrected": True,
-                        "fs": fs,
-                        "signalChannelSet": scs
-                    }]
-                    all_trial_rows.append(session_metric_rows[0])
+                session_metric_rows = [{
+                    "group": group_name,
+                    "mouse": mouse_id,
+                    "session": os.path.basename(s_path),
+                    "metric_source": "session_mean_trace",
+                    "baseline_mean": baseline_mean,
+                    "response_mean": response_mean,
+                    "delta": delta,
+                    "peak": peak,
+                    "auc": auc,
+                    "latency": latency,
+                    "n_trials": int(peri_arr.shape[0]),
+                    "n_timepoints": int(peri_arr.shape[1]),
+                    "session_z_baseline_corrected": True,
+                    "fs": fs,
+                    "signalChannelSet": scs
+                }]
+                all_trial_rows.append(session_metric_rows[0])
                 session_traces_long_csv = os.path.join(
                     mouse_folder, f"{session_basename}_peri_event_traces_LONG.csv"
                 )
@@ -544,7 +532,7 @@ def run_batch_processing(
                 ax.axvline(0, color="red", linestyle="--")
                 ax.set_title(f"{group_name} | {mouse_id} | {os.path.basename(s_path)}")
                 ax.set_xlabel("Time (s)")
-                ax.set_ylabel("ΔF/F (z-scored baseline)")
+                ax.set_ylabel("Î”F/F (z-scored baseline)")
                 fig.tight_layout()
                 fig.savefig(session_plot_path)
                 plt.close(fig)
@@ -635,7 +623,7 @@ def run_batch_processing(
                 continue
             trials_arr = np.vstack(trials)
             mouse_mean = np.mean(trials_arr, axis=0)
-            mouse_sem = compute_sem(trials_arr)
+            mouse_sem = trials_arr.std(axis=0) / math.sqrt(trials_arr.shape[0])
 
             per_group_mouse_means[gname].append({
                 "mouse": mouse_id,
@@ -699,7 +687,7 @@ def run_batch_processing(
 
         arr = np.vstack([mi["mean"] for mi in mouse_infos])
         g_mean = np.mean(arr, axis=0)
-        g_sem = compute_sem(arr)
+        g_sem = arr.std(axis=0) / math.sqrt(arr.shape[0])
         group_means_for_comparison[gname] = (g_mean, g_sem)
         group_mean_dict[gname] = g_mean
         group_sem_dict[gname] = g_sem
@@ -716,7 +704,7 @@ def run_batch_processing(
         ax.axvline(0, color="black", linestyle="--")
         ax.set_title(f"Group avg: {gname}")
         ax.set_xlabel("Time (s)")
-        ax.set_ylabel("ΔF/F (z-scored baseline)")
+        ax.set_ylabel("Î”F/F (z-scored baseline)")
         ax.legend(loc="best", fontsize="small")
         fig.tight_layout()
         fig.savefig(group_mean_plot)
@@ -740,7 +728,7 @@ def run_batch_processing(
 
         ax.axvline(0, color="black", linestyle="--")
         ax.set_xlabel("Time (s)")
-        ax.set_ylabel("ΔF/F (z-scored baseline)")
+        ax.set_ylabel("Î”F/F (z-scored baseline)")
         ax.set_title(f"All mice traces: {gname}")
         ax.legend(loc="best", fontsize="small")
         fig.tight_layout()
@@ -774,8 +762,8 @@ def run_batch_processing(
 
     ax.axvline(0, color="black", linestyle="--")
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("ΔF/F (z-scored baseline)")
-    ax.set_title(f"Group comparison — Event: {selected_event}")
+    ax.set_ylabel("Î”F/F (z-scored baseline)")
+    ax.set_title(f"Group comparison â€” Event: {selected_event}")
     ax.legend(loc="best", fontsize="small")
     fig.tight_layout()
     fig.savefig(combined_fig_path)
@@ -797,13 +785,9 @@ def run_batch_processing(
     # -------------------
     if len(all_trial_rows) > 0:
         all_trials_df = pd.DataFrame(all_trial_rows)
-        if global_zscore:
-            all_trials_df.sort_values(by=["group", "mouse", "session"], inplace=True)
-            all_trials_csv = os.path.join(event_folder, "all_groups_session_mean_metrics.csv")
-        else:
-            all_trials_csv = os.path.join(event_folder, "all_groups_trial_metrics.csv")
+        all_trials_csv = os.path.join(event_folder, "all_groups_session_mean_metrics.csv")
         all_trials_df.to_csv(all_trials_csv, index=False)
-        summary["output_files"]["all_groups_trial_metrics_csv"] = all_trials_csv
+        summary["output_files"]["all_groups_session_mean_metrics_csv"] = all_trials_csv
         if verbose:
             print(f"Saved master trial CSV -> {all_trials_csv}", flush=True)
     else:
@@ -828,7 +812,7 @@ def run_batch_processing(
                 continue
             trials_arr = np.vstack(trials)
             mouse_mean = np.mean(trials_arr, axis=0)
-            mouse_sem = compute_sem(trials_arr)
+            mouse_sem = trials_arr.std(axis=0) / math.sqrt(trials_arr.shape[0])
             mouse_prism_csv = os.path.join(prism_mice, f"{_safe_name(mouse_id)}_combined_prism.csv")
             save_prism_xy(peri_times, mouse_mean, mouse_sem, mouse_prism_csv)
             summary["output_files"].setdefault("prism_mouse_csvs", []).append(mouse_prism_csv)
@@ -862,3 +846,9 @@ def run_batch_processing(
         print(f"Saved summary_log.json -> {summary_path}", flush=True)
 
     return summary
+
+
+
+
+
+
