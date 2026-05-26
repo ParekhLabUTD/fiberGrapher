@@ -237,24 +237,41 @@ def run_batch_processing(
 
                 try:
                     if meta.get('event_interpretor', 1) == 2:
-                        pct_name = 'PtC1' if meta.get('signalChannelSet',1) == 1 else 'PtC2'
+                        scs_val = meta.get('signalChannelSet', 1)
+                        pct_name = 'PtC1' if scs_val == 1 else 'PtC2'
+                        c_name = 'C1__' if scs_val == 1 else 'C2__'
+                        
                         onset_list = None
+                        c12_idx = 1  # default to 1 (second code 12) for PtC
+                        used_epoc = None
+                        
                         try:
-                            onset_list = block.epocs[pct_name].onset
+                            # Prefer C1__/C2__ which uses the first code 12
+                            if c_name in block.epocs:
+                                onset_list = block.epocs[c_name].onset
+                                c12_idx = 0
+                                used_epoc = c_name
+                            elif pct_name in block.epocs:
+                                onset_list = block.epocs[pct_name].onset
+                                c12_idx = 1
+                                used_epoc = pct_name
                         except Exception:
                             pass
+
                         code12_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 12]
                         required_pct = _session_pct_idx + 1
-                        if onset_list is not None and len(onset_list) >= required_pct and len(code12_times) >= 2:
+                        required_code12s = c12_idx + 1
+                        
+                        if onset_list is not None and len(onset_list) >= required_pct and len(code12_times) >= required_code12s:
                             pct_onset = float(onset_list[_session_pct_idx])
-                            offset = compute_pct_offset(pct_onset, code12_times, code12_index=1)
+                            offset = compute_pct_offset(pct_onset, code12_times, code12_index=c12_idx)
                             sig, ctrl = _apply_pct_alignment(sig, ctrl, fs_orig, offset)
                             event_times = [t - offset for t in event_times]
                             if verbose:
-                                print(f"Alignment applied using PCT onset index {_session_pct_idx}, code12 index 1. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
+                                print(f"Alignment applied using {used_epoc} onset index {_session_pct_idx}, code12 index {c12_idx}. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
                         else:
                             if verbose:
-                                print(f"Alignment conditions not met (need {required_pct} PCT onset(s) and 2 code12(s)); skipping alignment", flush=True)
+                                print(f"Alignment conditions not met (need {required_pct} onset(s) and {required_code12s} code12(s)); skipping alignment", flush=True)
                 except Exception as e:
                     print("WARNING: alignment failed:", e, flush=True)
 
