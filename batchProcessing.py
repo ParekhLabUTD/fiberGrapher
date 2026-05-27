@@ -195,9 +195,20 @@ def run_batch_processing(
                     avail_streams = list(block.streams.keys())
                 except Exception:
                     avail_streams = []
+                try:
+                    avail_epocs = list(block.epocs.keys())
+                except Exception:
+                    avail_epocs = []
                 if verbose:
                     print(f"Loaded block: {s_path}", flush=True)
                     print("Available stream keys:", avail_streams, flush=True)
+                    print("Available epoc keys:", avail_epocs, flush=True)
+                    for ep_key in avail_epocs:
+                        try:
+                            ep_onsets = block.epocs[ep_key].onset
+                            print(f"  Epoc '{ep_key}': {len(ep_onsets)} onset(s) -> {list(ep_onsets[:5])}", flush=True)
+                        except Exception as ep_err:
+                            print(f"  Epoc '{ep_key}': could not read onsets ({ep_err})", flush=True)
 
                 sig_key = find_stream_by_substr(block, sig_sub)
                 ctrl_key = find_stream_by_substr(block, ctrl_sub)
@@ -242,36 +253,50 @@ def run_batch_processing(
                         c_name = 'C1__' if scs_val == 1 else 'C2__'
                         
                         onset_list = None
-                        c12_idx = 1  # default to 1 (second code 12) for PtC
+                        onset_idx = _session_pct_idx   # default: 2nd onset (index 1) for PtC
                         used_epoc = None
                         
+                        if verbose:
+                            print(f"Looking for epocs: '{c_name}' (preferred) or '{pct_name}' (fallback)", flush=True)
                         try:
-                            # Prefer C1__/C2__ which uses the first code 12
-                            if c_name in block.epocs:
+                            # Prefer C1__/C2__ which uses the 1st epoch onset
+                            if c_name in avail_epocs:
                                 onset_list = block.epocs[c_name].onset
-                                c12_idx = 0
+                                onset_idx = 0            # 1st onset for C1__/C2__
                                 used_epoc = c_name
-                            elif pct_name in block.epocs:
+                                if verbose:
+                                    print(f"  Found '{c_name}' with {len(onset_list)} onset(s): {list(onset_list[:5])}", flush=True)
+                            elif pct_name in avail_epocs:
                                 onset_list = block.epocs[pct_name].onset
-                                c12_idx = 1
+                                onset_idx = _session_pct_idx  # 2nd onset (index 1) for PtC
                                 used_epoc = pct_name
-                        except Exception:
-                            pass
+                                if verbose:
+                                    print(f"  Found '{pct_name}' with {len(onset_list)} onset(s): {list(onset_list[:5])}", flush=True)
+                            else:
+                                if verbose:
+                                    print(f"  Neither '{c_name}' nor '{pct_name}' found in block.epocs", flush=True)
+                        except Exception as epoc_err:
+                            if verbose:
+                                print(f"  Exception reading epoc onsets: {epoc_err}", flush=True)
 
+                        # Always align against the 2nd code-12 event
+                        c12_idx = 1
                         code12_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 12]
-                        required_pct = _session_pct_idx + 1
-                        required_code12s = c12_idx + 1
+                        if verbose:
+                            print(f"  Code-12 events found: {len(code12_times)} -> {code12_times[:5]}", flush=True)
+                        required_onsets = onset_idx + 1
+                        required_code12s = 2  # always need at least 2 code-12 events
                         
-                        if onset_list is not None and len(onset_list) >= required_pct and len(code12_times) >= required_code12s:
-                            pct_onset = float(onset_list[_session_pct_idx])
+                        if onset_list is not None and len(onset_list) >= required_onsets and len(code12_times) >= required_code12s:
+                            pct_onset = float(onset_list[onset_idx])
                             offset = compute_pct_offset(pct_onset, code12_times, code12_index=c12_idx)
                             sig, ctrl = _apply_pct_alignment(sig, ctrl, fs_orig, offset)
                             event_times = [t - offset for t in event_times]
                             if verbose:
-                                print(f"Alignment applied using {used_epoc} onset index {_session_pct_idx}, code12 index {c12_idx}. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
+                                print(f"Alignment applied using {used_epoc} onset index {onset_idx}, code12 index {c12_idx}. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
                         else:
                             if verbose:
-                                print(f"Alignment conditions not met (need {required_pct} onset(s) and {required_code12s} code12(s)); skipping alignment", flush=True)
+                                print(f"Alignment conditions not met: have {len(onset_list) if onset_list is not None else 0} onset(s) (need {required_onsets}), {len(code12_times)} code12(s) (need {required_code12s}); skipping alignment", flush=True)
                 except Exception as e:
                     print("WARNING: alignment failed:", e, flush=True)
 
