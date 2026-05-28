@@ -1084,6 +1084,15 @@ with tab4:
             # --- Global Z-score approach ---
             batch_global_zscore = st.checkbox("Use global session-mean Z-scoring (New Approach)", value=False, key="batch_global_zscore")
 
+            # --- Pooled baseline Z-score approach ---
+            batch_pooled_baseline_zscore = st.checkbox(
+                "Use pooled-baseline Z-scoring (shared baseline stats across all trials)",
+                value=False, key="batch_pooled_baseline_zscore"
+            )
+
+            if batch_global_zscore and batch_pooled_baseline_zscore:
+                st.warning("⚠️ Both global and pooled-baseline z-score are enabled — only pooled-baseline will be used.")
+
             pre_t = st.number_input("Peri-event PRE time (s)", min_value=0.0, value=5.0)
             post_t = st.number_input("Peri-event POST time (s)", min_value=0.0, value=10.0)
             baseline_lower = st.number_input("Baseline window start (s, relative to T0, negative)", value=-4.0)
@@ -1135,6 +1144,7 @@ with tab4:
                                 code0_cutoff=batch_code0_cutoff,
                                 signal_start_cutoff=batch_signal_start_cutoff,
                                 global_zscore=batch_global_zscore,
+                                pooled_baseline_zscore=batch_pooled_baseline_zscore,
                             )
                             st.success(f"Processing complete. Output folder: {summary['output_files']['event_folder']}")
                             st.write(summary)  # visible run summary in the UI

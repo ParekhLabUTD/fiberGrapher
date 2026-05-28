@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from splice_utils import load_splices, get_splice_mask, check_snippet_overlaps_splice, offset_splices
 from math_utils import (
     downsample_block_average, match_lengths, compute_dff,
-    zscore_baseline_with_fallback, compute_sem,
+    zscore_baseline_with_fallback, zscore_pooled_baseline, compute_sem,
     apply_pct_alignment as _apply_pct_alignment,
     apply_code0_cutoff, compute_pct_offset,
     compute_peri_time_vector, compute_trial_metrics,
@@ -82,7 +82,8 @@ def run_batch_processing(
     pct_onset_map=None,
     code0_cutoff=False,
     signal_start_cutoff=0.0,
-    global_zscore=False
+    global_zscore=False,
+    pooled_baseline_zscore=False
 ):
     timestamp_str = dt.now().strftime("%Y%m%d_%H%M%S")
     event_folder = os.path.join(base_path, "plots", f"{_safe_name(selected_event)}_{timestamp_str}")
@@ -390,6 +391,8 @@ def run_batch_processing(
                     print(f"Computed dF/F len={len(dff)} mean={np.mean(dff):.3f} std={np.std(dff):.3f}", flush=True)
                     if global_zscore:
                         print(f"Using full-session z-score for peri-event traces", flush=True)
+                    if pooled_baseline_zscore:
+                        print(f"Using pooled-baseline z-score for peri-event traces", flush=True)
 
                 peri_times, n_samples = compute_peri_time_vector(pre_t, post_t, fs)
                 if n_samples <= 0:
@@ -413,34 +416,123 @@ def run_batch_processing(
                 session_metric_rows = []
                 trial_index = 0
 
-                for ts in event_times:
-                    start_idx = int(round((ts - pre_t) * fs))
-                    end_idx = start_idx + n_samples
-                    trial_index += 1
-                    if start_idx < 0 or end_idx > len(dff):
-                        if verbose:
-                            print(f"  Skip trial {trial_index}: start={start_idx} end={end_idx} out of bounds (len={len(dff)})", flush=True)
-                        summary["invalid_trials"] += 1
+                # Baseline window indices (relative to snippet start)
+                bstart_rel = int(round((baseline_lower + pre_t) * fs))
+                bend_rel = int(round((baseline_upper + pre_t) * fs))
+
+                # ---- Pooled-baseline z-score: two-pass approach ----
+                if pooled_baseline_zscore:
+                    # PASS 1: collect all valid raw snippets and baseline windows
+                    _raw_snippets = []     # list of (trial_index, ts, snippet)
+                    _baseline_segments = []  # baseline windows for pooling
+                    _pass1_trial_index = 0
+
+                    for ts in event_times:
+                        start_idx = int(round((ts - pre_t) * fs))
+                        end_idx = start_idx + n_samples
+                        _pass1_trial_index += 1
+
+                        if start_idx < 0 or end_idx > len(dff):
+                            if verbose:
+                                print(f"  Skip trial {_pass1_trial_index}: start={start_idx} end={end_idx} out of bounds (len={len(dff)})", flush=True)
+                            summary["invalid_trials"] += 1
+                            summary["n_trials_total"] += 1
+                            continue
+
+                        if block_splices and check_snippet_overlaps_splice(ts, pre_t, post_t, block_splices):
+                            if verbose:
+                                print(f"  Skip trial {_pass1_trial_index}: peri-event window overlaps splice region", flush=True)
+                            summary["invalid_trials"] += 1
+                            summary["n_trials_total"] += 1
+                            continue
+
+                        snippet = dff[start_idx:end_idx].astype(float)
+                        _raw_snippets.append((_pass1_trial_index, ts, snippet))
+
+                        # Extract this trial's baseline window for the pool
+                        _bs = max(0, bstart_rel)
+                        _be = min(len(snippet), bend_rel)
+                        if _be > _bs:
+                            _baseline_segments.append(snippet[_bs:_be])
+                        else:
+                            # Fallback: use the pre-event portion
+                            fallback_end = int(round(pre_t * fs))
+                            if fallback_end > 0:
+                                _baseline_segments.append(snippet[:fallback_end])
+
+                    # Compute pooled baseline statistics
+                    if _baseline_segments:
+                        _pooled_baseline = np.concatenate(_baseline_segments)
+                        _pooled_mean = float(np.mean(_pooled_baseline))
+                        _pooled_std = float(np.std(_pooled_baseline))
+                    else:
+                        # Last resort: use full dF/F stats
+                        _pooled_mean = float(np.mean(dff))
+                        _pooled_std = float(np.std(dff))
+
+                    if verbose:
+                        print(f"  Pooled baseline: {len(_baseline_segments)} segments, "
+                              f"{len(_pooled_baseline) if _baseline_segments else 0} total samples, "
+                              f"mean={_pooled_mean:.4f}, std={_pooled_std:.4f}", flush=True)
+
+                    # PASS 2: z-score each snippet with pooled stats
+                    for _trial_idx, ts, snippet in _raw_snippets:
+                        snippet_z, zscored_flag = zscore_pooled_baseline(
+                            snippet, _pooled_mean, _pooled_std
+                        )
+
+                        metrics = compute_trial_metrics(
+                            snippet_z, fs, metric_start, metric_end, pre_t,
+                            detect_inhibitory=True
+                        )
+
+                        peri_traces.append(snippet_z)
+                        valid_event_times.append(ts)
+                        session_metric_rows.append({
+                            "group": group_name,
+                            "mouse": mouse_id,
+                            "session": os.path.basename(s_path),
+                            "trial_index": _trial_idx,
+                            "peak": metrics["peak"],
+                            "auc": metrics["auc"],
+                            "latency": metrics["latency"],
+                            "n_timepoints": len(snippet_z),
+                            "zscored": bool(zscored_flag),
+                            "pooled_baseline_zscore": True,
+                            "pooled_mean": _pooled_mean,
+                            "pooled_std": _pooled_std,
+                            "fs": fs,
+                            "signalChannelSet": scs
+                        })
+                        all_trial_rows.append(session_metric_rows[-1])
                         summary["n_trials_total"] += 1
-                        continue
+                        summary["valid_trials"] += 1
 
-                    # Skip trials whose peri-event window overlaps a spliced region
-                    if block_splices and check_snippet_overlaps_splice(ts, pre_t, post_t, block_splices):
-                        if verbose:
-                            print(f"  Skip trial {trial_index}: peri-event window overlaps splice region", flush=True)
-                        summary["invalid_trials"] += 1
-                        summary["n_trials_total"] += 1
-                        continue
+                # ---- Global session z-score (existing) ----
+                elif global_zscore:
+                    for ts in event_times:
+                        start_idx = int(round((ts - pre_t) * fs))
+                        end_idx = start_idx + n_samples
+                        trial_index += 1
+                        if start_idx < 0 or end_idx > len(dff):
+                            if verbose:
+                                print(f"  Skip trial {trial_index}: start={start_idx} end={end_idx} out of bounds (len={len(dff)})", flush=True)
+                            summary["invalid_trials"] += 1
+                            summary["n_trials_total"] += 1
+                            continue
 
-                    bstart_rel = int(round((baseline_lower + pre_t) * fs))
-                    bend_rel = int(round((baseline_upper + pre_t) * fs))
+                        if block_splices and check_snippet_overlaps_splice(ts, pre_t, post_t, block_splices):
+                            if verbose:
+                                print(f"  Skip trial {trial_index}: peri-event window overlaps splice region", flush=True)
+                            summary["invalid_trials"] += 1
+                            summary["n_trials_total"] += 1
+                            continue
 
-                    if global_zscore:
                         snippet = dff_z_session[start_idx:end_idx].astype(float)
-                        bstart_rel = max(0, bstart_rel)
-                        bend_rel = min(len(snippet), bend_rel)
-                        if bend_rel > bstart_rel:
-                            baseline_vals = snippet[bstart_rel:bend_rel]
+                        _bs = max(0, bstart_rel)
+                        _be = min(len(snippet), bend_rel)
+                        if _be > _bs:
+                            baseline_vals = snippet[_bs:_be]
                             mu = float(np.mean(baseline_vals))
                             snippet_z = snippet - mu
                             zscored_flag = True
@@ -456,7 +548,6 @@ def run_batch_processing(
                                 snippet_z = snippet - mu
                                 zscored_flag = True
 
-                        # Compute per-trial metrics (same as non-global path)
                         metrics = compute_trial_metrics(
                             snippet_z, fs, metric_start, metric_end, pre_t,
                             detect_inhibitory=True
@@ -482,7 +573,29 @@ def run_batch_processing(
                             "signalChannelSet": scs
                         })
                         all_trial_rows.append(session_metric_rows[-1])
-                    else:
+                        summary["n_trials_total"] += 1
+                        summary["valid_trials"] += 1
+
+                # ---- Per-trial baseline z-score (default) ----
+                else:
+                    for ts in event_times:
+                        start_idx = int(round((ts - pre_t) * fs))
+                        end_idx = start_idx + n_samples
+                        trial_index += 1
+                        if start_idx < 0 or end_idx > len(dff):
+                            if verbose:
+                                print(f"  Skip trial {trial_index}: start={start_idx} end={end_idx} out of bounds (len={len(dff)})", flush=True)
+                            summary["invalid_trials"] += 1
+                            summary["n_trials_total"] += 1
+                            continue
+
+                        if block_splices and check_snippet_overlaps_splice(ts, pre_t, post_t, block_splices):
+                            if verbose:
+                                print(f"  Skip trial {trial_index}: peri-event window overlaps splice region", flush=True)
+                            summary["invalid_trials"] += 1
+                            summary["n_trials_total"] += 1
+                            continue
+
                         snippet = dff[start_idx:end_idx].astype(float)
                         fallback_end = int(round(pre_t * fs))
                         global_mean = float(np.mean(dff))
@@ -517,8 +630,8 @@ def run_batch_processing(
                         })
 
                         all_trial_rows.append(session_metric_rows[-1])
-                    summary["n_trials_total"] += 1
-                    summary["valid_trials"] += 1
+                        summary["n_trials_total"] += 1
+                        summary["valid_trials"] += 1
 
                 if len(peri_traces) == 0:
                     print(f"WARNING: no valid peri-event snippets for session {s_path}", flush=True)

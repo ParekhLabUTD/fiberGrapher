@@ -241,6 +241,34 @@ def zscore_baseline_with_fallback(snippet, baseline_start_idx, baseline_end_idx,
     return snippet.copy(), False
 
 
+def zscore_pooled_baseline(snippet, pooled_mean, pooled_std):
+    """Z-score a snippet using externally-computed pooled baseline statistics.
+
+    All trials in a session share the same mean and std, computed from the
+    concatenation of every trial's baseline window.
+
+    Parameters
+    ----------
+    snippet : np.ndarray
+        1-D peri-event snippet (raw dF/F).
+    pooled_mean : float
+        Mean of all concatenated baseline windows.
+    pooled_std : float
+        Std of all concatenated baseline windows.
+
+    Returns
+    -------
+    z_snippet : np.ndarray
+        Z-scored snippet.
+    was_zscored : bool
+        True if pooled_std > 0 and a proper z-score was applied.
+    """
+    if pooled_std > 0:
+        return (snippet - pooled_mean) / pooled_std, True
+    else:
+        return snippet - pooled_mean, False
+
+
 # ---------------------------------------------------------------------------
 # 5. SEM calculation
 # ---------------------------------------------------------------------------
