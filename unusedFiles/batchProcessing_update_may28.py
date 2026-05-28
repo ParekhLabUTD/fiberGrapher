@@ -13,13 +13,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from splice_utils import load_splices, get_splice_mask, check_snippet_overlaps_splice, offset_splices
-from math_utils import (
-    downsample_block_average, match_lengths, compute_dff,
-    zscore_baseline_with_fallback, compute_sem,
-    apply_pct_alignment as _apply_pct_alignment,
-    apply_code0_cutoff, compute_pct_offset,
-    compute_peri_time_vector, compute_trial_metrics,
-)
 
 # helper safe name
 def _safe_name(s: str) -> str:
@@ -80,9 +73,7 @@ def run_batch_processing(
     code12_index=1,
     pct_onset_index=1,
     pct_onset_map=None,
-    code0_cutoff=False,
-    signal_start_cutoff=0.0,
-    global_zscore=False
+    code0_cutoff=False
 ):
     timestamp_str = dt.now().strftime("%Y%m%d_%H%M%S")
     event_folder = os.path.join(base_path, "plots", f"{_safe_name(selected_event)}_{timestamp_str}")
@@ -195,20 +186,9 @@ def run_batch_processing(
                     avail_streams = list(block.streams.keys())
                 except Exception:
                     avail_streams = []
-                try:
-                    avail_epocs = list(block.epocs.keys())
-                except Exception:
-                    avail_epocs = []
                 if verbose:
                     print(f"Loaded block: {s_path}", flush=True)
                     print("Available stream keys:", avail_streams, flush=True)
-                    print("Available epoc keys:", avail_epocs, flush=True)
-                    for ep_key in avail_epocs:
-                        try:
-                            ep_onsets = block.epocs[ep_key].onset
-                            print(f"  Epoc '{ep_key}': {len(ep_onsets)} onset(s) -> {list(ep_onsets[:5])}", flush=True)
-                        except Exception as ep_err:
-                            print(f"  Epoc '{ep_key}': could not read onsets ({ep_err})", flush=True)
 
                 sig_key = find_stream_by_substr(block, sig_sub)
                 ctrl_key = find_stream_by_substr(block, ctrl_sub)
@@ -247,85 +227,82 @@ def run_batch_processing(
                     print(f"PCT onset index for this session: {_session_pct_idx}", flush=True)
 
                 try:
-                    if meta.get('event_interpretor', 1) == 2:
-                        scs_val = meta.get('signalChannelSet', 1)
-                        pct_name = 'PtC1' if scs_val == 1 else 'PtC2'
-                        c_name = 'C1__' if scs_val == 1 else 'C2__'
-                        
-                        onset_list = None
-                        onset_idx = _session_pct_idx   # default: 2nd onset (index 1) for PtC
-                        used_epoc = None
-                        
-                        if verbose:
-                            print(f"Looking for epocs: '{c_name}' (preferred) or '{pct_name}' (fallback)", flush=True)
-                        try:
-                            # Prefer C1__/C2__ which uses the 1st epoch onset
-                            if c_name in avail_epocs:
-                                onset_list = block.epocs[c_name].onset
-                                onset_idx = 0            # 1st onset for C1__/C2__
-                                used_epoc = c_name
-                                if verbose:
-                                    print(f"  Found '{c_name}' with {len(onset_list)} onset(s): {list(onset_list[:5])}", flush=True)
-                            elif pct_name in avail_epocs:
-                                onset_list = block.epocs[pct_name].onset
-                                onset_idx = _session_pct_idx  # 2nd onset (index 1) for PtC
-                                used_epoc = pct_name
-                                if verbose:
-                                    print(f"  Found '{pct_name}' with {len(onset_list)} onset(s): {list(onset_list[:5])}", flush=True)
-                            else:
-                                if verbose:
-                                    print(f"  Neither '{c_name}' nor '{pct_name}' found in block.epocs", flush=True)
-                        except Exception as epoc_err:
-                            if verbose:
-                                print(f"  Exception reading epoc onsets: {epoc_err}", flush=True)
+                    print("----- BEFORE PCT ALIGNMENT CHECK -----", flush=True)
+                    print(f"meta event_interpretor = {meta.get('event_interpretor', 'MISSING')}", flush=True)
+                    print(f"_session_pct_idx = {_session_pct_idx}", flush=True)
+                    print(f"Available epocs = {list(block.epocs.keys())}", flush=True)
+                    print(f"code12_times first 5 = {[e['timestamp_s'] for e in meta.get('events', []) if e.get('code') == 12][:5]}", flush=True)
+                    print(f"number of code12_times = {len([e['timestamp_s'] for e in meta.get('events', []) if e.get('code') == 12])}", flush=True)
+                    print("--------------------------------------", flush=True)
 
-                        # Always align against the 2nd code-12 event
-                        c12_idx = 1
-                        code12_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 12]
+                    if meta.get('event_interpretor', 1) == 2:
+                        print("DEBUG: ENTERED interpretor == 2 PCT ALIGNMENT BLOCK", flush=True)
+
+                        scs = int(meta.get('signalChannelSet', 1))
+                        # First try the expected PtC name.
+                        if scs == 1:
+                            pct_candidates = ['PtC1', 'C1__']
+                        else:
+                            pct_candidates = ['PtC2', 'C2__']
+
+                        pct_name = None
+                        onset_list = None
+
+                        for cand in pct_candidates:
+                            if cand in block.epocs.keys():
+                                pct_name = cand
+                                onset_list = block.epocs[cand].onset
+                                break
+
                         if verbose:
-                            print(f"  Code-12 events found: {len(code12_times)} -> {code12_times[:5]}", flush=True)
-                        required_onsets = onset_idx + 1
-                        required_code12s = 2  # always need at least 2 code-12 events
-                        
-                        if onset_list is not None and len(onset_list) >= required_onsets and len(code12_times) >= required_code12s:
-                            pct_onset = float(onset_list[onset_idx])
-                            offset = compute_pct_offset(pct_onset, code12_times, code12_index=c12_idx)
-                            sig, ctrl = _apply_pct_alignment(sig, ctrl, fs_orig, offset)
-                            #event_times = [t - offset for t in event_times] -- 
+                            print(f"PCT epoc candidates checked: {pct_candidates}", flush=True)
+                            print(f"Using PCT epoc: {pct_name}", flush=True)
+                        #pct_name = 'PtC1' if meta.get('signalChannelSet',1) == 1 else 'PtC2'
+                        #onset_list = None
+                        #try:
+                            #onset_list = block.epocs[pct_name].onset
+                        #except Exception:
+                           # pass
+                        code12_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 12]
+                        required_pct = _session_pct_idx + 1
+                        if onset_list is not None and len(onset_list) >= required_pct and len(code12_times) >= 2:
+                            pct_onset = float(onset_list[_session_pct_idx])
+                            offset = pct_onset - code12_times[1]
+                            time_full = np.arange(len(sig)) / fs_orig
+                            time_full -= offset
+                            valid = time_full >= 0
+                            sig = sig[valid]
+                            ctrl = ctrl[valid]
+                            print("----- ALIGNMENT DEBUG -----", flush=True)
+                            print(f"selected_event = {selected_event}", flush=True)
+                            print(f"_session_pct_idx = {_session_pct_idx}", flush=True)
+                            print(f"pct_onset = {pct_onset}", flush=True)
+                            print(f"code12_times[1] = {code12_times[1]}", flush=True)
+                            print(f"offset = {offset}", flush=True)
+                            print(f"len(sig) after trim = {len(sig)}", flush=True)
+                            print(f"first 5 event_times = {event_times[:5]}", flush=True)
+                            print("---------------------------", flush=True)
+                            #event_times = [t - offset for t in event_times]
                             if verbose:
-                                print(f"Alignment applied using {used_epoc} onset index {onset_idx}, code12 index {c12_idx}. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
+                                print(f"Alignment applied using PCT onset index {_session_pct_idx}, code12 index 1. offset={offset:.3f}s trimmed samples -> {len(sig)} remain", flush=True)
                         else:
                             if verbose:
-                                print(f"Alignment conditions not met: have {len(onset_list) if onset_list is not None else 0} onset(s) (need {required_onsets}), {len(code12_times)} code12(s) (need {required_code12s}); skipping alignment", flush=True)
+                                print(f"Alignment conditions not met (need {required_pct} PCT onset(s) and 2 code12(s)); skipping alignment", flush=True)
                 except Exception as e:
                     print("WARNING: alignment failed:", e, flush=True)
 
-                # --- Signal start cutoff: match Tab 2 by dropping bad early signal before z-scoring ---
-                _cutoff = float(signal_start_cutoff or 0.0)
-                if _cutoff > 0:
-                    start_sample = int(round(_cutoff * fs_orig))
-                    if start_sample > 0 and start_sample < len(sig):
-                        sig = sig[start_sample:]
-                        ctrl = ctrl[start_sample:]
-                        event_times = [t - _cutoff for t in event_times]
-                        event_times = [t for t in event_times if t >= 0]
-                        if verbose:
-                            print(f"Signal start cutoff at {_cutoff:.2f}s -> {len(sig)} samples remain; events shifted by -{_cutoff:.2f}s", flush=True)
-                    else:
-                        _cutoff = 0.0  # cutoff didn't actually apply
-                else:
-                    _cutoff = 0.0
-
                 # --- Code 0 cutoff: truncate signal/control after code 0 timestamp ---
-
                 if code0_cutoff:
                     _code0_times = [e["timestamp_s"] for e in meta.get("events", []) if e.get("code") == 0]
                     if _code0_times:
-                        _code0_t = _code0_times[0] 
-                        sig, ctrl = apply_code0_cutoff(sig, ctrl, fs_orig, _code0_t)
+                        _code0_t = _code0_times[0]
+                        _time_arr = np.arange(len(sig)) / fs_orig
+                        _code0_keep = _time_arr <= _code0_t
+                        sig = sig[_code0_keep]
+                        ctrl = ctrl[_code0_keep]
                         event_times = [t for t in event_times if t <= _code0_t]
                         if verbose:
-                            print(f"Code 0 cutoff at {_code0_t:.2f}s (shifted from raw {_code0_times[0]:.2f}s) -> {len(sig)} samples remain", flush=True)
+                            print(f"Code 0 cutoff at {_code0_t:.2f}s -> {len(sig)} samples remain", flush=True)
 
                 if len(event_times) == 0:
                     warn = f"no '{selected_event}' events in session {s_path}"
@@ -334,10 +311,8 @@ def run_batch_processing(
                     continue
 
                 # --- Load and adjust splices for this block (per channel) ---
-                # Shift splices by both PCT offset AND signal_start_cutoff
-                _total_time_offset = offset + _cutoff
                 block_splices_raw = load_splices(s_path, channel=scs)
-                block_splices = offset_splices(block_splices_raw, _total_time_offset) if block_splices_raw else []
+                block_splices = offset_splices(block_splices_raw, offset) if block_splices_raw else []
                 if verbose and block_splices:
                     print(f"Loaded {len(block_splices)} splice region(s) for this block", flush=True)
                     for _ss, _se in block_splices:
@@ -346,8 +321,8 @@ def run_batch_processing(
                 ds = int(downsample_factor)
                 if ds > 1:
                     # Block-averaging downsample (Lerner et al. 2015)
-                    sig = downsample_block_average(sig, ds)
-                    ctrl = downsample_block_average(ctrl, ds)
+                    sig = np.array([np.mean(sig[i_:i_+ds]) for i_ in range(0, len(sig), ds)])
+                    ctrl = np.array([np.mean(ctrl[i_:i_+ds]) for i_ in range(0, len(ctrl), ds)])
                     fs = fs_orig / ds
                 else:
                     fs = fs_orig
@@ -356,47 +331,38 @@ def run_batch_processing(
                     print(f"After downsampling: sig_len={len(sig)}, fs={fs}", flush=True)
 
                 # --- Safe truncation before regression ---
-                _orig_sig_len, _orig_ctrl_len = len(sig), len(ctrl)
-                sig, ctrl = match_lengths(sig, ctrl)
-                min_len = len(sig)
-                if _orig_sig_len != _orig_ctrl_len:
+                min_len = min(len(sig), len(ctrl))
+                if len(sig) != len(ctrl):
                     if verbose:
-                        print(f"Signal/control length mismatch: sig={_orig_sig_len}, ctrl={_orig_ctrl_len}. Truncating to {min_len}.", flush=True)
+                        print(f"Signal/control length mismatch: sig={len(sig)}, ctrl={len(ctrl)}. Truncating to {min_len}.", flush=True)
+                    sig = sig[:min_len]
+                    ctrl = ctrl[:min_len]
 
                 try:
                     # Exclude spliced regions from polyfit regression
                     if block_splices:
                         splice_mask = get_splice_mask(min_len, fs, block_splices)
+                        p = np.polyfit(ctrl[splice_mask], sig[splice_mask], 1)
                     else:
-                        splice_mask = None
-                    dff, _fitted, _coeffs = compute_dff(sig, ctrl,
-                                                        splice_mask=splice_mask,
-                                                        epsilon=1e-12)
+                        p = np.polyfit(ctrl, sig, 1)
+                    fitted = p[0] * ctrl + p[1]
+                    dff = 100.0 * (sig - fitted) / (fitted + 1e-12)
                 except Exception as e:
                     err = f"regression_dff_failed: {e}"
                     print("ERROR:", err, flush=True)
                     summary["errors"].append({"session": s_path, "error": err})
                     continue
 
-                if global_zscore:
-                    dff_mean = float(np.mean(dff))
-                    dff_std = float(np.std(dff))
-                    if dff_std > 0:
-                        dff_z_session = (dff - dff_mean) / dff_std
-                    else:
-                        dff_z_session = dff - dff_mean
-
                 if verbose:
                     print(f"Computed dF/F len={len(dff)} mean={np.mean(dff):.3f} std={np.std(dff):.3f}", flush=True)
-                    if global_zscore:
-                        print(f"Using full-session z-score for peri-event traces", flush=True)
 
-                peri_times, n_samples = compute_peri_time_vector(pre_t, post_t, fs)
+                n_samples = int(round((pre_t + post_t) * fs))
                 if n_samples <= 0:
                     err = f"invalid n_samples computed: {(pre_t+post_t)}*{fs} -> {n_samples}"
                     print("ERROR:", err, flush=True)
                     summary["errors"].append({"session": s_path, "error": err})
                     continue
+                peri_times = (np.arange(n_samples) / fs) - pre_t
 
                 if verbose:
                     print(f"Peri window samples: {n_samples}, peri_times[0:3]={peri_times[:3]}", flush=True)
@@ -409,7 +375,6 @@ def run_batch_processing(
                 session_prism_csv = os.path.join(prism_sessions, f"{_safe_name(mouse_id)}_{session_basename}_prism.csv")
 
                 peri_traces = []
-                valid_event_times = []  # track timestamps of valid (non-skipped) trials
                 session_metric_rows = []
                 trial_index = 0
 
@@ -432,91 +397,93 @@ def run_batch_processing(
                         summary["n_trials_total"] += 1
                         continue
 
+                    snippet = dff[start_idx:end_idx].astype(float)
+
                     bstart_rel = int(round((baseline_lower + pre_t) * fs))
                     bend_rel = int(round((baseline_upper + pre_t) * fs))
-
-                    if global_zscore:
-                        snippet = dff_z_session[start_idx:end_idx].astype(float)
-                        bstart_rel = max(0, bstart_rel)
-                        bend_rel = min(len(snippet), bend_rel)
-                        if bend_rel > bstart_rel:
-                            baseline_vals = snippet[bstart_rel:bend_rel]
-                            mu = float(np.mean(baseline_vals))
-                            snippet_z = snippet - mu
+                    bstart_rel = max(0, bstart_rel)
+                    bend_rel = min(len(snippet), bend_rel)
+                    if bend_rel > bstart_rel:
+                        baseline_vals = snippet[bstart_rel:bend_rel]
+                        mu = float(np.mean(baseline_vals))
+                        sigma = float(np.std(baseline_vals))
+                        if sigma > 0:
+                            snippet_z = (snippet - mu) / sigma
                             zscored_flag = True
                         else:
-                            fallback_end = int(round(pre_t * fs))
-                            if fallback_end > 0:
-                                fallback_vals = snippet[:fallback_end]
-                                mu = float(np.mean(fallback_vals))
-                                snippet_z = snippet - mu
+                            snippet_z = snippet - mu
+                            zscored_flag = False
+                        if trial_index <= 20:
+                            print("----- Z-SCORE DEBUG -----", flush=True)
+                            print(f"mouse = {mouse_id}", flush=True)
+                            print(f"session = {os.path.basename(s_path)}", flush=True)
+                            print(f"trial_index = {trial_index}", flush=True)
+                            print(f"event_time ts = {ts}", flush=True)
+                            print(f"baseline window = {baseline_lower} to {baseline_upper} sec", flush=True)
+                            print(f"baseline n points = {len(baseline_vals)}", flush=True)
+                            print(f"mu baseline mean = {mu}", flush=True)
+                            print(f"sigma baseline SD = {sigma}", flush=True)
+                            print(f"raw snippet min/max = {np.min(snippet)}, {np.max(snippet)}", flush=True)
+                            print(f"z snippet min/max = {np.min(snippet_z)}, {np.max(snippet_z)}", flush=True)
+                            print("-------------------------", flush=True)
+                    else:
+                        fallback_end = int(round(pre_t * fs))
+                        if fallback_end > 0:
+                            fallback_vals = snippet[:fallback_end]
+                            mu = float(np.mean(fallback_vals))
+                            sigma = float(np.std(fallback_vals))
+                            if sigma > 0:
+                                snippet_z = (snippet - mu) / sigma
                                 zscored_flag = True
                             else:
-                                mu = float(np.mean(dff_z_session))
                                 snippet_z = snippet - mu
-                                zscored_flag = True
+                                zscored_flag = False
+                        else:
+                            mu = float(np.mean(dff))
+                            snippet_z = snippet - mu
+                            zscored_flag = False
 
-                        # Compute per-trial metrics (same as non-global path)
-                        metrics = compute_trial_metrics(
-                            snippet_z, fs, metric_start, metric_end, pre_t,
-                            detect_inhibitory=True
-                        )
-                        peak = metrics["peak"]
-                        auc = metrics["auc"]
-                        latency = metrics["latency"]
+                    mstart_idx = int(round((pre_t + metric_start) * fs))
+                    mend_idx = int(round((pre_t + metric_end) * fs))
+                    mstart_idx = max(0, mstart_idx)
+                    mend_idx = min(len(snippet_z), mend_idx)
 
-                        peri_traces.append(snippet_z)
-                        valid_event_times.append(ts)
-                        session_metric_rows.append({
-                            "group": group_name,
-                            "mouse": mouse_id,
-                            "session": os.path.basename(s_path),
-                            "trial_index": trial_index,
-                            "peak": peak,
-                            "auc": auc,
-                            "latency": latency,
-                            "n_timepoints": len(snippet_z),
-                            "zscored": bool(zscored_flag),
-                            "global_zscore": True,
-                            "fs": fs,
-                            "signalChannelSet": scs
-                        })
-                        all_trial_rows.append(session_metric_rows[-1])
+                    if mend_idx > mstart_idx:
+                        post_segment = snippet_z[mstart_idx:mend_idx]
+                        auc = float(np.trapz(post_segment, dx=1.0/fs))
+
+                        # Detect excitatory vs inhibitory response:
+                        # use whichever extreme has the larger absolute value
+                        seg_max = float(np.max(post_segment))
+                        seg_min = float(np.min(post_segment))
+                        if abs(seg_min) > abs(seg_max):
+                            # Inhibitory: nadir is the dominant peak
+                            peak = seg_min
+                            latency_idx = int(np.argmin(post_segment))
+                        else:
+                            # Excitatory (or flat): max is the dominant peak
+                            peak = seg_max
+                            latency_idx = int(np.argmax(post_segment))
+                        latency = float(latency_idx / fs + metric_start)
                     else:
-                        snippet = dff[start_idx:end_idx].astype(float)
-                        fallback_end = int(round(pre_t * fs))
-                        global_mean = float(np.mean(dff))
-                        snippet_z, zscored_flag = zscore_baseline_with_fallback(
-                            snippet, bstart_rel, bend_rel,
-                            fallback_end_idx=fallback_end,
-                            global_mean=global_mean
-                        )
+                        peak, auc, latency = np.nan, np.nan, np.nan
 
-                        metrics = compute_trial_metrics(
-                            snippet_z, fs, metric_start, metric_end, pre_t,
-                            detect_inhibitory=True
-                        )
-                        peak = metrics["peak"]
-                        auc = metrics["auc"]
-                        latency = metrics["latency"]
+                    peri_traces.append(snippet_z)
+                    session_metric_rows.append({
+                        "group": group_name,
+                        "mouse": mouse_id,
+                        "session": os.path.basename(s_path),
+                        "trial_index": trial_index,
+                        "peak": peak,
+                        "auc": auc,
+                        "latency": latency,
+                        "n_timepoints": len(snippet_z),
+                        "zscored": bool(zscored_flag),
+                        "fs": fs,
+                        "signalChannelSet": scs
+                    })
 
-                        peri_traces.append(snippet_z)
-                        valid_event_times.append(ts)
-                        session_metric_rows.append({
-                            "group": group_name,
-                            "mouse": mouse_id,
-                            "session": os.path.basename(s_path),
-                            "trial_index": trial_index,
-                            "peak": peak,
-                            "auc": auc,
-                            "latency": latency,
-                            "n_timepoints": len(snippet_z),
-                            "zscored": bool(zscored_flag),
-                            "fs": fs,
-                            "signalChannelSet": scs
-                        })
-
-                        all_trial_rows.append(session_metric_rows[-1])
+                    all_trial_rows.append(session_metric_rows[-1])
                     summary["n_trials_total"] += 1
                     summary["valid_trials"] += 1
 
@@ -527,47 +494,7 @@ def run_batch_processing(
 
                 peri_arr = np.vstack(peri_traces)
                 session_mean = np.mean(peri_arr, axis=0)
-                session_sem = compute_sem(peri_arr)
-
-                if global_zscore:
-                    # Also compute session-mean-level metrics for summary
-                    baseline_mask = (peri_times >= baseline_lower) & (peri_times <= baseline_upper)
-                    response_mask = (peri_times >= metric_start) & (peri_times <= metric_end)
-
-                    baseline_segment = session_mean[baseline_mask]
-                    response_segment = session_mean[response_mask]
-                    response_times = peri_times[response_mask]
-
-                    baseline_mean = float(np.mean(baseline_segment)) if len(baseline_segment) > 0 else np.nan
-                    response_mean = float(np.mean(response_segment)) if len(response_segment) > 0 else np.nan
-                    delta = response_mean - baseline_mean if np.isfinite(response_mean) and np.isfinite(baseline_mean) else np.nan
-
-                    if len(response_segment) > 0:
-                        peak_idx = int(np.argmax(np.abs(response_segment)))
-                        _sm_peak = float(response_segment[peak_idx])
-                        _sm_latency = float(response_times[peak_idx])
-                        _sm_auc = float(np.sum((response_segment[:-1] + response_segment[1:]) * 0.5 * np.diff(response_times))) if len(response_segment) > 1 else 0.0
-                    else:
-                        _sm_peak, _sm_latency, _sm_auc = np.nan, np.nan, np.nan
-
-                    session_metric_rows.append({
-                        "group": group_name,
-                        "mouse": mouse_id,
-                        "session": os.path.basename(s_path),
-                        "metric_source": "session_mean_trace",
-                        "baseline_mean": baseline_mean,
-                        "response_mean": response_mean,
-                        "delta": delta,
-                        "peak": _sm_peak,
-                        "auc": _sm_auc,
-                        "latency": _sm_latency,
-                        "n_trials": int(peri_arr.shape[0]),
-                        "n_timepoints": int(peri_arr.shape[1]),
-                        "session_z_baseline_corrected": True,
-                        "fs": fs,
-                        "signalChannelSet": scs
-                    })
-                    all_trial_rows.append(session_metric_rows[-1])
+                session_sem = peri_arr.std(axis=0) / math.sqrt(peri_arr.shape[0])
                 session_traces_long_csv = os.path.join(
                     mouse_folder, f"{session_basename}_peri_event_traces_LONG.csv"
                 )
@@ -575,8 +502,7 @@ def run_batch_processing(
                 n_trials, n_tp = peri_arr.shape
                 global_time_s = []
 
-                # Use valid_event_times (only timestamps of non-skipped trials)
-                for ts in valid_event_times:
+                for ts in event_times[:n_trials]:
                     peri_global = ts + peri_times
                     global_time_s.extend(peri_global)
 
@@ -673,34 +599,33 @@ def run_batch_processing(
             b = np.round(a, 6).tobytes()
         return hashlib.md5(b).hexdigest()
 
-    if verbose:
-        print("\n--- DEBUG DUMP START ---", flush=True)
-        print("groups_dict (raw):", repr(groups_dict), flush=True)
-        print("mice_seen:", repr(mice_seen), flush=True)
+    print("\n--- DEBUG DUMP START ---", flush=True)
+    print("groups_dict (raw):", repr(groups_dict), flush=True)
+    print("mice_seen:", repr(mice_seen), flush=True)
 
-        print("\nper_mouse_pooled_trials keys and info:", flush=True)
-        for m, trials in per_mouse_pooled_trials.items():
-            try:
-                trials_arr = np.vstack(trials)
-                mean_trace = np.mean(trials_arr, axis=0)
-                print(f"  MOUSE: {m} | n_trials={len(trials)} | mean_shape={mean_trace.shape} | hash={arr_hash(mean_trace)} | first5={np.around(mean_trace[:5],4).tolist()}", flush=True)
-            except Exception as e:
-                print(f"  MOUSE: {m} | ERROR building mean: {e}", flush=True)
-
-        print("\nper_group_mouse_means_by_group (pre-build) summary:", flush=True)
-        for gname, mice_map in per_mouse_pooled_trials_by_group.items():
-            counts = {m: len(trs) for m, trs in mice_map.items()}
-            print(f"  GROUP: {gname} -> {counts}", flush=True)
-
+    print("\nper_mouse_pooled_trials keys and info:", flush=True)
+    for m, trials in per_mouse_pooled_trials.items():
         try:
-            for root, dirs, files in os.walk(event_folder):
-                if root == event_folder:
-                    print("\nTop-level event_folder contents:", "dirs:", dirs, "files:", files, flush=True)
-                    break
+            trials_arr = np.vstack(trials)
+            mean_trace = np.mean(trials_arr, axis=0)
+            print(f"  MOUSE: {m} | n_trials={len(trials)} | mean_shape={mean_trace.shape} | hash={arr_hash(mean_trace)} | first5={np.around(mean_trace[:5],4).tolist()}", flush=True)
         except Exception as e:
-            print("Could not list event_folder:", e, flush=True)
+            print(f"  MOUSE: {m} | ERROR building mean: {e}", flush=True)
 
-        print("--- DEBUG DUMP END ---\n", flush=True)
+    print("\nper_group_mouse_means_by_group (pre-build) summary:", flush=True)
+    for gname, mice_map in per_mouse_pooled_trials_by_group.items():
+        counts = {m: len(trs) for m, trs in mice_map.items()}
+        print(f"  GROUP: {gname} -> {counts}", flush=True)
+
+    try:
+        for root, dirs, files in os.walk(event_folder):
+            if root == event_folder:
+                print("\nTop-level event_folder contents:", "dirs:", dirs, "files:", files, flush=True)
+                break
+    except Exception as e:
+        print("Could not list event_folder:", e, flush=True)
+
+    print("--- DEBUG DUMP END ---\n", flush=True)
 
     # -------------------
     # Build per-group mouse means from per_mouse_pooled_trials_by_group
@@ -714,7 +639,7 @@ def run_batch_processing(
                 continue
             trials_arr = np.vstack(trials)
             mouse_mean = np.mean(trials_arr, axis=0)
-            mouse_sem = compute_sem(trials_arr)
+            mouse_sem = trials_arr.std(axis=0) / math.sqrt(trials_arr.shape[0])
 
             per_group_mouse_means[gname].append({
                 "mouse": mouse_id,
@@ -778,7 +703,7 @@ def run_batch_processing(
 
         arr = np.vstack([mi["mean"] for mi in mouse_infos])
         g_mean = np.mean(arr, axis=0)
-        g_sem = compute_sem(arr)
+        g_sem = arr.std(axis=0) / math.sqrt(arr.shape[0])
         group_means_for_comparison[gname] = (g_mean, g_sem)
         group_mean_dict[gname] = g_mean
         group_sem_dict[gname] = g_sem
@@ -876,11 +801,7 @@ def run_batch_processing(
     # -------------------
     if len(all_trial_rows) > 0:
         all_trials_df = pd.DataFrame(all_trial_rows)
-        if global_zscore:
-            all_trials_df.sort_values(by=["group", "mouse", "session"], inplace=True)
-            all_trials_csv = os.path.join(event_folder, "all_groups_session_mean_metrics.csv")
-        else:
-            all_trials_csv = os.path.join(event_folder, "all_groups_trial_metrics.csv")
+        all_trials_csv = os.path.join(event_folder, "all_groups_trial_metrics.csv")
         all_trials_df.to_csv(all_trials_csv, index=False)
         summary["output_files"]["all_groups_trial_metrics_csv"] = all_trials_csv
         if verbose:
@@ -907,7 +828,7 @@ def run_batch_processing(
                 continue
             trials_arr = np.vstack(trials)
             mouse_mean = np.mean(trials_arr, axis=0)
-            mouse_sem = compute_sem(trials_arr)
+            mouse_sem = trials_arr.std(axis=0) / math.sqrt(trials_arr.shape[0])
             mouse_prism_csv = os.path.join(prism_mice, f"{_safe_name(mouse_id)}_combined_prism.csv")
             save_prism_xy(peri_times, mouse_mean, mouse_sem, mouse_prism_csv)
             summary["output_files"].setdefault("prism_mouse_csvs", []).append(mouse_prism_csv)
@@ -917,6 +838,10 @@ def run_batch_processing(
             print(f"WARNING: failed to save Prism mouse CSV for {mouse_id}: {e}", flush=True)
 
     summary["n_mice"] = len(mice_seen)
+    summary["n_sessions"] = summary["n_sessions"]
+    summary["n_trials_total"] = summary["n_trials_total"]
+    summary["valid_trials"] = summary["valid_trials"]
+    summary["invalid_trials"] = summary["invalid_trials"]
 
     summary["output_files"].update({
         "event_folder": event_folder,
